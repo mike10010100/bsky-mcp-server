@@ -159,9 +159,11 @@ export function registerTools(server: McpServer, getAgent: AgentProvider): void 
         "reply",
         "quote",
         "starterpack-joined"
-      ])).optional().describe("Filter by notification types (e.g., ['reply', 'mention']). If not provided, returns all types.")
+      ])).optional().describe("Filter by notification types (e.g., ['reply', 'mention']). If not provided, returns all types."),
+      replyFilter: z.enum(["all", "responded", "unresponded"]).optional().default("all").describe("Filter reply notifications by response status. 'responded' shows only replies you've responded to, 'unresponded' shows only replies you haven't responded to. This filter only applies to notifications with reason 'reply'."),
+      authorFilter: z.string().optional().describe("Filter notifications by the handle or DID of the user who triggered them (e.g., 'alice.bsky.social').")
     },
-    async ({ limit, reasons }) => {
+    async ({ limit, reasons, replyFilter, authorFilter }) => {
       const agent = getAgent();
       if (!agent) {
         return mcpErrorResponse("Not connected to Bluesky. Check your environment variables.");
@@ -169,17 +171,48 @@ export function registerTools(server: McpServer, getAgent: AgentProvider): void 
 
       try {
         const MAX_NOTIFICATIONS = 500; // Safety limit
-        let allNotifications: any[] = [];
+        let matchedNotifications: any[] = [];
         let nextCursor: string | undefined = undefined;
         let shouldContinueFetching = true;
 
-        while (shouldContinueFetching && allNotifications.length < MAX_NOTIFICATIONS) {
-          const batchLimit = Math.min(100, limit - allNotifications.length);
+        const targetAuthor = authorFilter ? (authorFilter.startsWith('@') ? authorFilter.substring(1) : authorFilter) : null;
 
+        // If filtering by response status, we need our own recent replies to compare
+        let repliedToUris = new Set<string>();
+        if (replyFilter !== "all") {
+          const myDid = agent.did;
+          if (!myDid) {
+            return mcpErrorResponse("Could not determine your DID. Are you authenticated?");
+          }
+
+          // Fetch last 100 posts to see what we've replied to
+          // We use posts_with_replies to see where we've engaged
+          const myFeed = await agent.app.bsky.feed.getAuthorFeed({
+            actor: myDid,
+            limit: 100,
+            filter: 'posts_with_replies'
+          });
+
+          if (myFeed.success) {
+            for (const item of myFeed.data.feed) {
+              if (item.reply?.parent && 
+                  item.reply.parent.$type === 'app.bsky.feed.defs#postView' && 
+                  'uri' in item.reply.parent) {
+                repliedToUris.add((item.reply.parent as any).uri);
+              }
+            }
+          }
+        }
+
+        // If replyFilter is set but no reasons provided, default to 'reply'
+        const effectiveReasons = (replyFilter !== "all" && (!reasons || reasons.length === 0)) ? ["reply"] : reasons;
+
+        while (shouldContinueFetching && matchedNotifications.length < limit && matchedNotifications.length < MAX_NOTIFICATIONS) {
+          // Fetch batches until we have enough matches
           const response = await agent.app.bsky.notification.listNotifications({
-            limit: batchLimit,
+            limit: Math.max(50, Math.min(100, limit - matchedNotifications.length + 10)),
             cursor: nextCursor,
-            reasons: reasons
+            reasons: effectiveReasons
           });
 
           if (!response.success) {
@@ -187,19 +220,43 @@ export function registerTools(server: McpServer, getAgent: AgentProvider): void 
           }
 
           const { notifications, cursor } = response.data;
-          allNotifications = allNotifications.concat(notifications);
+          
+          // Apply filters
+          const filtered = notifications.filter(notif => {
+            // Apply author filter if provided
+            if (targetAuthor) {
+              if (notif.author.handle !== targetAuthor && notif.author.did !== targetAuthor) {
+                return false;
+              }
+            }
+
+            // If it's not a reply, only keep it if we're not filtering replies
+            // or if this reason was specifically requested in the original reasons
+            if (notif.reason !== 'reply') {
+              return replyFilter === 'all' || (reasons && reasons.includes(notif.reason as any));
+            }
+            
+            // It's a reply, so apply the reply status filter
+            if (replyFilter === 'all') return true;
+            const isResponded = repliedToUris.has(notif.uri);
+            return replyFilter === 'responded' ? isResponded : !isResponded;
+          });
+
+          matchedNotifications = matchedNotifications.concat(filtered);
           nextCursor = cursor;
 
           // Stop if we have enough or no more results
-          shouldContinueFetching = allNotifications.length < limit && !!cursor;
+          shouldContinueFetching = matchedNotifications.length < limit && !!cursor;
         }
 
         // Limit to requested count
-        const finalNotifications = allNotifications.slice(0, limit);
+        const finalNotifications = matchedNotifications.slice(0, limit);
 
         if (finalNotifications.length === 0) {
           const filterDesc = reasons ? ` with filter: ${reasons.join(', ')}` : '';
-          return mcpSuccessResponse(`No notifications found${filterDesc}.`);
+          const replyDesc = replyFilter !== 'all' ? ` and reply status: ${replyFilter}` : '';
+          const authorDesc = authorFilter ? ` and author: ${authorFilter}` : '';
+          return mcpSuccessResponse(`No notifications found${filterDesc}${replyDesc}${authorDesc}.`);
         }
 
         // Format notifications output
@@ -207,7 +264,13 @@ export function registerTools(server: McpServer, getAgent: AgentProvider): void 
 
         for (const notif of finalNotifications) {
           const displayName = notif.author.displayName || notif.author.handle;
-          output += `[${notif.reason.toUpperCase()}] ${displayName} (@${notif.author.handle})\n`;
+          let statusLabel = `[${notif.reason.toUpperCase()}]`;
+          
+          if (notif.reason === 'reply' && replyFilter !== 'all') {
+            statusLabel += ` [${repliedToUris.has(notif.uri) ? 'RESPONDED' : 'UNRESPONDED'}]`;
+          }
+          
+          output += `${statusLabel} ${displayName} (@${notif.author.handle})\n`;
           output += `  URI: ${notif.uri}\n`;
           output += `  Time: ${notif.indexedAt}\n`;
           output += `  Read: ${notif.isRead}\n`;
