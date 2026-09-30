@@ -1,14 +1,32 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer } from "@modelcontextprotocol/server";
 
 /**
  * Registers all Bluesky MCP resources on the provided MCP server
  * @param server The MCP server instance
  */
-export function registerResources(server: McpServer): void {
+export function registerResources(server: any): void {
+  const register = (
+    name: string,
+    uri: string,
+    metadata: { title: string; description: string; mimeType: string },
+    handler: (uri: URL) => Promise<{ contents: Array<{ uri: string; text: string }> }>
+  ) => {
+    if (typeof (server as any).registerResource === "function") {
+      (server as any).registerResource(name, uri, metadata, handler);
+    } else if (typeof (server as any).resource === "function") {
+      (server as any).resource(name, uri, handler);
+    }
+  };
+
   // Add Bluesky platform context resource
-  server.resource(
+  register(
     "bluesky-platform-info",
     "bluesky://platform-info",
+    {
+      title: "Bluesky Platform Information",
+      description: "Comprehensive information about the Bluesky platform, its features, and culture",
+      mimeType: "text/markdown",
+    },
     async (uri) => ({
       contents: [{
         uri: uri.href,
@@ -96,9 +114,14 @@ The platform is fully functional but continues to evolve with user feedback and 
   );
 
   // Add Bluesky post schema documentation resource
-  server.resource(
+  register(
     "bluesky-post-schema",
     "bluesky://post-schema",
+    {
+      title: "Bluesky Post Schema Documentation",
+      description: "Technical documentation of the Bluesky post schema and structure",
+      mimeType: "text/markdown",
+    },
     async (uri) => ({
       contents: [{
         uri: uri.href,

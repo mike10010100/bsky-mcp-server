@@ -10,6 +10,7 @@ const EXPECTED_TOOLS = [
   "get-timeline-posts",
   "get-notifications",
   "create-post",
+  "delete-post",
   "get-profile",
   "search-posts",
   "get-post-thread",
@@ -47,7 +48,7 @@ async function testExpectedToolSet() {
     const { tools } = await client.listTools();
     const names = tools.map(t => t.name).sort();
     assert.deepEqual(names, [...EXPECTED_TOOLS].sort(),
-      `registered tool set drifted from the 23 expected names`);
+      `registered tool set drifted from the 24 expected names`);
   } finally {
     await close();
   }
@@ -279,9 +280,67 @@ async function testUnfollowByUserScansForRkey() {
   }
 }
 
+async function testDeletePostInvokesAgent() {
+  let deletedUri: string | null = null;
+  const fakeAgent = {
+    deletePost: async (uri: string) => {
+      deletedUri = uri;
+      return { success: true };
+    },
+  } as unknown as Agent;
+
+  const { client, close } = await harness(() => fakeAgent);
+  try {
+    const target = "at://did:plc:alice/app.bsky.feed.post/3ktest123";
+    const result: any = await client.callTool({
+      name: "delete-post",
+      arguments: { postUri: target },
+    });
+    assert.equal(result.isError, undefined);
+    assert.equal(deletedUri, target);
+  } finally {
+    await close();
+  }
+}
+
+async function testToolAnnotations() {
+  const { client, close } = await harness(() => null);
+  try {
+    const { tools } = await client.listTools();
+    const byName = new Map(tools.map(t => [t.name, t]));
+
+    const del = byName.get("delete-post");
+    assert.ok(del, "delete-post tool should exist");
+    assert.equal(del.annotations?.destructiveHint, true, "delete-post should be destructiveHint: true");
+    assert.equal(del.annotations?.idempotentHint, true, "delete-post should be idempotentHint: true");
+    assert.equal(del.annotations?.readOnlyHint, false, "delete-post should be readOnlyHint: false");
+
+    const timeline = byName.get("get-timeline-posts");
+    assert.ok(timeline, "get-timeline-posts tool should exist");
+    assert.equal(timeline.annotations?.readOnlyHint, true, "get-timeline-posts should be readOnlyHint: true");
+
+    const unfollow = byName.get("unfollow-user");
+    assert.ok(unfollow, "unfollow-user tool should exist");
+    assert.equal(unfollow.annotations?.destructiveHint, true, "unfollow-user should be destructiveHint: true");
+    assert.equal(unfollow.annotations?.idempotentHint, true, "unfollow-user should be idempotentHint: true");
+
+    const like = byName.get("like-post");
+    assert.ok(like, "like-post tool should exist");
+    assert.equal(like.annotations?.idempotentHint, true, "like-post should be idempotentHint: true");
+    assert.equal(like.annotations?.readOnlyHint, false, "like-post should be readOnlyHint: false");
+
+    const handle = byName.get("get-my-handle-and-did");
+    assert.ok(handle, "get-my-handle-and-did tool should exist");
+    assert.equal(handle.annotations?.readOnlyHint, true, "get-my-handle-and-did should be readOnlyHint: true");
+  } finally {
+    await close();
+  }
+}
+
 async function main() {
   const cases: Array<[string, () => Promise<void>]> = [
-    ["registers exactly the expected 23 tools", testExpectedToolSet],
+    ["registers exactly the expected 24 tools", testExpectedToolSet],
+    ["tools include MCP 2026-07-28 annotations (readOnly, destructive, idempotent hints)", testToolAnnotations],
     ["tools error out when getAgent returns null", testNullAgentReturnsError],
     ["getAgent is resolved per tool call, not cached", testAgentIsResolvedPerCall],
     ["tool handlers invoke methods on the resolved agent", testAgentMethodIsInvoked],
@@ -289,6 +348,7 @@ async function main() {
     ["unfollow-user with followUri deletes directly", testUnfollowByUri],
     ["unfollow-user rejects URIs that aren't the authed user's", testUnfollowRejectsForeignUri],
     ["unfollow-user with user scans listRecords for the rkey", testUnfollowByUserScansForRkey],
+    ["delete-post invokes deletePost on agent", testDeletePostInvokesAgent],
   ];
 
   let failed = 0;

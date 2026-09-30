@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { McpServer } from "@modelcontextprotocol/server";
+import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import { AtpAgent } from "@atproto/api";
 import * as dotenv from "dotenv";
 import { registerResources } from './resources.js';
@@ -18,6 +18,8 @@ dotenv.config({ path: '.env.local', override: true });
 const server = new McpServer({
   name: "bluesky",
   version: "1.0.0",
+  title: "Bluesky MCP Server",
+  description: "MCP server for interacting with Bluesky social network and AT Protocol",
 });
 
 registerResources(server);
@@ -61,11 +63,11 @@ async function initializeBlueskyConnection() {
   try {
     await initializeBlueskyConnection();
 
-    const transport = new StdioServerTransport();
-    await server.connect(transport);
-    console.error("Bluesky MCP Server running on stdio");
+    serveStdio(() => server);
+    console.error("Bluesky MCP Server running on stdio (MCP 2026-07-28 dual-era)");
   } catch (error) {
     console.error("Failed to start server:", error);
     process.exit(1);
   }
 })();
+

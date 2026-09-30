@@ -1,6 +1,8 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { Agent, RichText } from "@atproto/api";
+import fs from 'fs';
+import path from 'path';
 import {
   cleanHandle,
   formatSummaryText,
@@ -15,6 +17,25 @@ import { preprocessPosts, formatPostThread } from "./llm-preprocessor.js";
 import { resourcesList } from './resources.js';
 import { fetchLinkMetadata, uploadThumbnail } from './link-preview.js';
 
+function getMimeType(filePath: string): string {
+  const ext = path.extname(filePath).toLowerCase();
+  switch (ext) {
+    case '.png':
+      return 'image/png';
+    case '.jpg':
+    case '.jpeg':
+      return 'image/jpeg';
+    case '.webp':
+      return 'image/webp';
+    case '.gif':
+      return 'image/gif';
+    case '.svg':
+      return 'image/svg+xml';
+    default:
+      return 'image/jpeg';
+  }
+}
+
 export type AgentProvider = () => Agent | null;
 
 /**
@@ -23,8 +44,145 @@ export type AgentProvider = () => Agent | null;
  * or null if the caller is not authenticated. It is evaluated per tool call
  * so OAuth-backed sessions can rotate credentials between invocations.
  */
-export function registerTools(server: McpServer, getAgent: AgentProvider): void {
-  server.tool(
+export function registerTools(server: any, getAgent: AgentProvider): void {
+  const toolMetadata: Record<
+    string,
+    {
+      title: string;
+      annotations?: {
+        readOnlyHint?: boolean;
+        destructiveHint?: boolean;
+        idempotentHint?: boolean;
+        openWorldHint?: boolean;
+      };
+    }
+  > = {
+    'get-my-handle-and-did': {
+      title: 'Get My Handle and DID',
+      annotations: { readOnlyHint: true },
+    },
+    'get-timeline-posts': {
+      title: 'Get Timeline Posts',
+      annotations: { readOnlyHint: true },
+    },
+    'get-notifications': {
+      title: 'Get Notifications',
+      annotations: { readOnlyHint: true },
+    },
+    'create-post': {
+      title: 'Create Post',
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+    },
+    'delete-post': {
+      title: 'Delete Post',
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true },
+    },
+    'get-profile': {
+      title: 'Get Profile',
+      annotations: { readOnlyHint: true },
+    },
+    'search-posts': {
+      title: 'Search Posts',
+      annotations: { readOnlyHint: true },
+    },
+    'get-post-thread': {
+      title: 'Get Post Thread',
+      annotations: { readOnlyHint: true },
+    },
+    'convert-url-to-uri': {
+      title: 'Convert URL to AT URI',
+      annotations: { readOnlyHint: true },
+    },
+    'search-people': {
+      title: 'Search People',
+      annotations: { readOnlyHint: true },
+    },
+    'search-feeds': {
+      title: 'Search Feeds',
+      annotations: { readOnlyHint: true },
+    },
+    'get-liked-posts': {
+      title: 'Get Liked Posts',
+      annotations: { readOnlyHint: true },
+    },
+    'get-trends': {
+      title: 'Get Trends',
+      annotations: { readOnlyHint: true },
+    },
+    'like-post': {
+      title: 'Like Post',
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+    },
+    'follow-user': {
+      title: 'Follow User',
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+    },
+    'unfollow-user': {
+      title: 'Unfollow User',
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true },
+    },
+    'get-pinned-feeds': {
+      title: 'Get Pinned Feeds',
+      annotations: { readOnlyHint: true },
+    },
+    'get-feed-posts': {
+      title: 'Get Feed Posts',
+      annotations: { readOnlyHint: true },
+    },
+    'get-list-posts': {
+      title: 'Get List Posts',
+      annotations: { readOnlyHint: true },
+    },
+    'get-user-posts': {
+      title: 'Get User Posts',
+      annotations: { readOnlyHint: true },
+    },
+    'get-follows': {
+      title: 'Get Follows',
+      annotations: { readOnlyHint: true },
+    },
+    'get-followers': {
+      title: 'Get Followers',
+      annotations: { readOnlyHint: true },
+    },
+    'get-post-likes': {
+      title: 'Get Post Likes',
+      annotations: { readOnlyHint: true },
+    },
+    'list-resources': {
+      title: 'List Resources',
+      annotations: { readOnlyHint: true },
+    },
+  };
+
+  const registerTool = (
+    name: string,
+    description: string,
+    schema: Record<string, z.ZodTypeAny>,
+    handler: (args: any) => Promise<any>
+  ) => {
+    const meta = toolMetadata[name] || {
+      title: name,
+      annotations: {},
+    };
+
+    if (typeof server.registerTool === "function") {
+      server.registerTool(
+        name,
+        {
+          title: meta.title,
+          description,
+          inputSchema: z.object(schema),
+          annotations: meta.annotations,
+        },
+        handler
+      );
+    } else if (typeof server.tool === "function") {
+      server.tool(name, description, schema, handler);
+    }
+  };
+
+  registerTool(
     'get-my-handle-and-did',
     'Return the handle and did of the currently authenticated user for this blusesky session. Useful for when someone asks information about themselves using "me" or "my" on bluesky.',
     {},
@@ -46,7 +204,7 @@ export function registerTools(server: McpServer, getAgent: AgentProvider): void 
   );
 
 
-  server.tool(
+  registerTool(
     "get-timeline-posts",
     "Fetch your home timeline from Bluesky, which includes posts from all of the people you follow in reverse chronological order",
     {
@@ -146,7 +304,7 @@ export function registerTools(server: McpServer, getAgent: AgentProvider): void 
     }
   );
 
-  server.tool(
+  registerTool(
     "get-notifications",
     "Fetch your notifications from Bluesky, optionally filtered by type (reply, mention, like, repost, follow, quote)",
     {
@@ -287,16 +445,19 @@ export function registerTools(server: McpServer, getAgent: AgentProvider): void 
     }
   );
 
-  server.tool(
+  registerTool(
     "create-post",
-    "Create a new post on Bluesky",
+    "Create a new post on Bluesky, with support for replies, quote posts, images, and link previews",
     {
       text: z.string().max(300).describe("The content of your post"),
-      replyTo: z.string().optional().describe("Optional URI of post to reply to"),
-      previewUrl: z.string().url().optional().describe("Optional URL to generate preview card for. If not provided, uses first URL detected in text."),
-      embedPreview: z.boolean().optional().default(true).describe("Whether to fetch and attach a link preview card. Defaults to true."),
+      replyTo: z.string().optional().describe("Optional URI or web URL of post to reply to"),
+      quoteUri: z.string().optional().describe("Optional AT URI or web URL of a post to quote (e.g. at://did:plc:.../app.bsky.feed.post/... or https://bsky.app/profile/.../post/...)"),
+      imagePaths: z.array(z.string()).optional().describe("Optional array of file paths to images (JPEG, PNG, GIF, WebP) to upload and attach (up to 4)"),
+      imageAlts: z.array(z.string()).optional().describe("Optional alt text descriptions for the attached images"),
+      previewUrl: z.string().url().optional().describe("Optional URL to generate preview card for. If not provided, uses first external URL detected in text."),
+      embedPreview: z.boolean().optional().default(true).describe("Whether to fetch and attach a link preview card if no quote post or images are attached. Defaults to true."),
     },
-    async ({ text, replyTo, previewUrl, embedPreview = true }) => {
+    async ({ text, replyTo, quoteUri, imagePaths, imageAlts, previewUrl, embedPreview = true }) => {
       const agent = getAgent();
       if (!agent) {
         return mcpErrorResponse("Not connected to Bluesky. Check your environment variables.");
@@ -316,17 +477,17 @@ export function registerTools(server: McpServer, getAgent: AgentProvider): void 
           record.facets = rt.facets;
         }
 
-        let replyRef;
+        // 1. Handle reply format
         if (replyTo) {
-          // Handle reply format
           try {
-            const parts = replyTo.split('/');
-            const did = parts[2];
-            const rkey = parts[parts.length - 1];
-            const collection = parts[parts.length - 2] === 'app.bsky.feed.post' ? 'app.bsky.feed.post' : parts[parts.length - 2];
+            let replyUri = replyTo.trim();
+            if (replyUri.startsWith('http://') || replyUri.startsWith('https://')) {
+              const converted = await convertBskyUrlToAtUri(replyUri, agent);
+              if (converted) replyUri = converted;
+            }
 
             // Resolve the CID of the post we're replying to
-            const cidResponse = await agent.app.bsky.feed.getPostThread({ uri: replyTo });
+            const cidResponse = await agent.app.bsky.feed.getPostThread({ uri: replyUri });
             if (!cidResponse.success) {
               throw new Error('Could not get post information');
             }
@@ -336,32 +497,108 @@ export function registerTools(server: McpServer, getAgent: AgentProvider): void 
             const parentCid = parentPost.cid;
             const parentRecord = parentPost.record;
 
-            // Determine the root — if parent is a reply, use its root;
-            // otherwise the parent IS the root. Setting both to the parent
-            // when replying to a nested reply breaks thread rendering in
-            // the Bluesky web UI.
             let rootUri: string;
             let rootCid: string;
             if (parentRecord.reply) {
               rootUri = parentRecord.reply.root.uri;
               rootCid = parentRecord.reply.root.cid;
             } else {
-              rootUri = replyTo;
+              rootUri = replyUri;
               rootCid = parentCid;
             }
 
             record.reply = {
-              parent: { uri: replyTo, cid: parentCid },
+              parent: { uri: replyUri, cid: parentCid },
               root: { uri: rootUri, cid: rootCid }
             };
-
           } catch (error) {
             return mcpErrorResponse(`Error parsing reply URI: ${error instanceof Error ? error.message : String(error)}`);
           }
         }
 
-        // Generate link preview embed if enabled.
-        if (embedPreview) {
+        // 2. Handle Quote Post resolution
+        let resolvedQuoteUri: string | null = null;
+        let resolvedQuoteCid: string | null = null;
+
+        if (quoteUri) {
+          let target = quoteUri.trim();
+          if (target.startsWith('http://') || target.startsWith('https://')) {
+            const converted = await convertBskyUrlToAtUri(target, agent);
+            if (converted) target = converted;
+          }
+          const threadRes = await agent.app.bsky.feed.getPostThread({ uri: target });
+          if (threadRes.success && (threadRes.data.thread as any)?.post) {
+            resolvedQuoteUri = target;
+            resolvedQuoteCid = (threadRes.data.thread as any).post.cid;
+          }
+        } else if (previewUrl && (previewUrl.includes('bsky.app/profile/') && previewUrl.includes('/post/'))) {
+          // Auto-detect Bluesky post URL passed as previewUrl
+          const converted = await convertBskyUrlToAtUri(previewUrl, agent);
+          if (converted) {
+            const threadRes = await agent.app.bsky.feed.getPostThread({ uri: converted });
+            if (threadRes.success && (threadRes.data.thread as any)?.post) {
+              resolvedQuoteUri = converted;
+              resolvedQuoteCid = (threadRes.data.thread as any).post.cid;
+            }
+          }
+        }
+
+        // 3. Handle Image Uploads
+        let imagesEmbed: any = null;
+        if (imagePaths && imagePaths.length > 0) {
+          const uploadedImages = [];
+          for (let i = 0; i < Math.min(imagePaths.length, 4); i++) {
+            const imgPath = imagePaths[i];
+            if (!fs.existsSync(imgPath)) {
+              return mcpErrorResponse(`Image file not found: ${imgPath}`);
+            }
+            const mimeType = getMimeType(imgPath);
+            const imageBytes = await fs.promises.readFile(imgPath);
+            const uploadRes = await agent.uploadBlob(imageBytes, { encoding: mimeType });
+            if (!uploadRes.success) {
+              return mcpErrorResponse(`Failed to upload image blob: ${imgPath}`);
+            }
+            uploadedImages.push({
+              image: uploadRes.data.blob,
+              alt: imageAlts?.[i] || ''
+            });
+          }
+          if (uploadedImages.length > 0) {
+            imagesEmbed = {
+              $type: 'app.bsky.embed.images',
+              images: uploadedImages
+            };
+          }
+        }
+
+        // 4. Construct Embed
+        if (resolvedQuoteUri && resolvedQuoteCid && imagesEmbed) {
+          // Quote Post with Media
+          record.embed = {
+            $type: 'app.bsky.embed.recordWithMedia',
+            record: {
+              $type: 'app.bsky.embed.record',
+              record: {
+                uri: resolvedQuoteUri,
+                cid: resolvedQuoteCid
+              }
+            },
+            media: imagesEmbed
+          };
+        } else if (resolvedQuoteUri && resolvedQuoteCid) {
+          // Quote Post only
+          record.embed = {
+            $type: 'app.bsky.embed.record',
+            record: {
+              uri: resolvedQuoteUri,
+              cid: resolvedQuoteCid
+            }
+          };
+        } else if (imagesEmbed) {
+          // Images only
+          record.embed = imagesEmbed;
+        } else if (embedPreview) {
+          // External link preview
           const urlToPreview = previewUrl || extractFirstUrl(text);
           if (urlToPreview) {
             const metadata = await fetchLinkMetadata(urlToPreview);
@@ -396,7 +633,37 @@ export function registerTools(server: McpServer, getAgent: AgentProvider): void 
     }
   );
 
-  server.tool(
+  registerTool(
+    "delete-post",
+    "Delete a post on Bluesky using its AT URI or web URL",
+    {
+      postUri: z.string().describe("The AT URI (at://did:plc:.../app.bsky.feed.post/...) or Bluesky web URL (https://bsky.app/profile/.../post/...) of the post to delete"),
+    },
+    async ({ postUri }) => {
+      const agent = getAgent();
+      if (!agent) {
+        return mcpErrorResponse("Not connected to Bluesky. Check your environment variables.");
+      }
+
+      try {
+        let uriToDelete = postUri.trim();
+        if (uriToDelete.startsWith('http://') || uriToDelete.startsWith('https://')) {
+          const converted = await convertBskyUrlToAtUri(uriToDelete, agent);
+          if (!converted) {
+            return mcpErrorResponse(`Failed to convert web URL to AT URI: ${postUri}`);
+          }
+          uriToDelete = converted;
+        }
+
+        await agent.deletePost(uriToDelete);
+        return mcpSuccessResponse(`Post deleted successfully! URI: ${uriToDelete}`);
+      } catch (error) {
+        return mcpErrorResponse(`Error deleting post: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  );
+
+  registerTool(
     "get-profile",
     "Get a user's profile from Bluesky",
     {
@@ -432,7 +699,7 @@ ${profile.labels?.length ? `Labels: ${profile.labels.map((l: any) => l.val).join
     }
   );
 
-  server.tool(
+  registerTool(
     "search-posts",
     "Search for posts on Bluesky. Note: Bluesky uses strict AND matching - all search terms must be present in a post for it to match. This differs from web search engines which use loose/fuzzy matching. Searching for 'a b c' requires ALL of a, b, AND c to appear in matching posts. Supported operators: from:handle, to:handle, mentions:handle, url:domain, lang:code (e.g., lang:en), has:images, has:video, has:link.",
     {
@@ -479,7 +746,7 @@ ${profile.labels?.length ? `Labels: ${profile.labels.map((l: any) => l.val).join
     }
   );
 
-  server.tool(
+  registerTool(
     "get-post-thread",
     "Get a full conversation thread for a specific post, showing replies and context",
     {
@@ -517,7 +784,7 @@ ${profile.labels?.length ? `Labels: ${profile.labels.map((l: any) => l.val).join
     }
   );
 
-  server.tool(
+  registerTool(
     "convert-url-to-uri",
     "Convert a Bluesky web URL to an AT URI format that can be used with other tools",
     {
@@ -543,7 +810,7 @@ ${profile.labels?.length ? `Labels: ${profile.labels.map((l: any) => l.val).join
     }
   );
 
-  server.tool(
+  registerTool(
     "search-people",
     "Search for users/actors on Bluesky",
     {
@@ -589,7 +856,7 @@ ${actor.indexedAt ? `Indexed At: ${new Date(actor.indexedAt).toLocaleString()}` 
     }
   );
 
-  server.tool(
+  registerTool(
     "search-feeds",
     "Search for custom feeds on Bluesky",
     {
@@ -636,7 +903,7 @@ ${feed.indexedAt ? `Indexed At: ${new Date(feed.indexedAt).toLocaleString()}` : 
     }
   );
 
-  server.tool(
+  registerTool(
     "get-liked-posts",
     "Get a list of posts that the authenticated user has liked",
     {
@@ -716,7 +983,7 @@ ${feed.indexedAt ? `Indexed At: ${new Date(feed.indexedAt).toLocaleString()}` : 
     }
   );
 
-  server.tool(
+  registerTool(
     "get-trends",
     "Get current trending topics on Bluesky",
     {
@@ -774,7 +1041,7 @@ Feed Link: https://bsky.app${topic.link}
     }
   );
 
-  server.tool(
+  registerTool(
     "like-post",
     "Like a post on Bluesky",
     {
@@ -813,7 +1080,7 @@ Feed Link: https://bsky.app${topic.link}
     }
   );
 
-  server.tool(
+  registerTool(
     "follow-user",
     "Follow a user on Bluesky",
     {
@@ -843,7 +1110,7 @@ Feed Link: https://bsky.app${topic.link}
     }
   );
 
-  server.tool(
+  registerTool(
     "unfollow-user",
     "Remove an existing follow from the authenticated user's Bluesky account. Pass followUri (preferred — the at:// URI of your follow record, as returned by get-follows for self) for a direct delete with no extra round trips. If you only have a handle or DID, pass user instead and the tool will scan your follow records to find the matching rkey before deleting.",
     {
@@ -932,7 +1199,7 @@ Feed Link: https://bsky.app${topic.link}
     }
   );
 
-  server.tool(
+  registerTool(
     "get-pinned-feeds",
     "Get the authenticated user's pinned feeds and lists.",
     {},
@@ -1060,7 +1327,7 @@ ${feed.purpose ? `Purpose: ${feed.purpose}` : ''}`;
     }
   );
 
-  server.tool(
+  registerTool(
     "get-feed-posts",
     "Fetch posts from a specified feed",
     {
@@ -1169,7 +1436,7 @@ ${feed.purpose ? `Purpose: ${feed.purpose}` : ''}`;
     }
   );
 
-  server.tool(
+  registerTool(
     "get-list-posts",
     "Fetch posts from users in a specified list",
     {
@@ -1278,7 +1545,7 @@ ${feed.purpose ? `Purpose: ${feed.purpose}` : ''}`;
     }
   );
 
-  server.tool(
+  registerTool(
     "get-user-posts",
     "Fetch posts from a specific user",
     {
@@ -1399,7 +1666,7 @@ ${feed.purpose ? `Purpose: ${feed.purpose}` : ''}`;
     }
   );
 
-  server.tool(
+  registerTool(
     "get-follows",
     "Get one page of users that a person follows. For the authenticated user's own follows, reads records directly from their PDS (fast when colocated, surfaces the follow record URI needed for unfollow-user, and preserves deactivated/takedown follows that the AppView filters out); otherwise uses the AppView graph.getFollows endpoint. Returns a cursor that should be passed back in to fetch the next page.",
     {
@@ -1543,7 +1810,7 @@ ${p?.indexedAt ? `Indexed at: ${new Date(p.indexedAt).toLocaleString()}` : ''}
     }
   );
 
-  server.tool(
+  registerTool(
     "get-followers",
     "Get a list of users that follow a person",
     {
@@ -1641,7 +1908,7 @@ ${follower.indexedAt ? `Following since: ${new Date(follower.indexedAt).toLocale
     }
   );
 
-  server.tool(
+  registerTool(
     "get-post-likes",
     "Get information about users who have liked a specific post",
     {
@@ -1710,7 +1977,7 @@ ${like.indexedAt ? `Liked at: ${new Date(like.indexedAt).toLocaleString()}` : ''
     }
   );
 
-  server.tool(
+  registerTool(
     "list-resources",
     "List all available MCP resources with their descriptions",
     {},

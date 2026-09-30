@@ -1,4 +1,4 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 
 /**
@@ -29,19 +29,33 @@ Please keep the summary concise (about 3-5 paragraphs) and focus on the most mea
  * Registers all Bluesky MCP prompts on the provided MCP server
  * @param server The MCP server instance
  */
-export function registerPrompts(server: McpServer): void {
-  // Timeline summary prompt
-  server.prompt(
-    "summarize-timeline",
-    {},
-    () => ({
-      messages: [{
-        role: "user",
-        content: {
-          type: "text",
-          text: TIMELINE_SUMMARY_PROMPT
-        }
-      }]
-    })
-  );
-} 
+export function registerPrompts(server: McpServer | any): void {
+  const handler = () => ({
+    messages: [{
+      role: "user" as const,
+      content: {
+        type: "text" as const,
+        text: TIMELINE_SUMMARY_PROMPT
+      }
+    }]
+  });
+
+  if (typeof server.registerPrompt === 'function') {
+    server.registerPrompt(
+      "summarize-timeline",
+      {
+        title: "Summarize Timeline",
+        description: "A prompt that instructs the LLM to fetch the Bluesky timeline and create a summary of posts.",
+        argsSchema: z.object({})
+      },
+      handler
+    );
+  } else if (typeof server.prompt === 'function') {
+    server.prompt(
+      "summarize-timeline",
+      {},
+      handler
+    );
+  }
+}
+ 
