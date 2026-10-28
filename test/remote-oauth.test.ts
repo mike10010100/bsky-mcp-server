@@ -92,7 +92,7 @@ async function testProtectedResourceMetadata() {
     const r = await req(`${baseUrl}/.well-known/oauth-protected-resource`);
     assert.equal(r.status, 200);
     const body = await r.json() as any;
-    assert.deepEqual(body.scopes_supported.sort(), ["atproto", "transition:generic"]);
+    assert.deepEqual(body.scopes_supported.sort(), ["atproto", "transition:chat.bsky", "transition:generic"]);
     assert.equal(body.resource_name, "Bluesky MCP");
   } finally {
     await stop();

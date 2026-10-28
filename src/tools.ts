@@ -5,6 +5,7 @@ import fs from 'fs';
 import path from 'path';
 import {
   cleanHandle,
+  facetsToMarkdown,
   formatSummaryText,
   getFeedNameFromId,
   validateUri,
@@ -37,6 +38,139 @@ function getMimeType(filePath: string): string {
 }
 
 export type AgentProvider = () => Agent | null;
+
+const BSKY_CHAT_PROXY_DID = "did:web:api.bsky.chat";
+
+/**
+ * Returns an Agent configured with the Bluesky chat service proxy header
+ * (`atproto-proxy: did:web:api.bsky.chat#bsky_chat`), falling back to the
+ * original agent in test environments where `withProxy` is not stubbed.
+ */
+function getChatAgent(agent: Agent): Agent {
+  if (typeof (agent as any).withProxy === "function") {
+    return agent.withProxy("bsky_chat", BSKY_CHAT_PROXY_DID);
+  }
+  return agent;
+}
+
+/**
+ * Resolve a handle (e.g., "@alice.bsky.social" or "alice.bsky.social") or DID to a DID.
+ */
+async function resolveUserDid(agent: Agent, user: string): Promise<string> {
+  const cleaned = cleanHandle(user.trim());
+  if (!cleaned) {
+    throw new Error("User handle or DID cannot be empty.");
+  }
+  if (cleaned.startsWith("did:")) {
+    return cleaned;
+  }
+  if (typeof (agent as any).resolveHandle === "function") {
+    const res = await agent.resolveHandle({ handle: cleaned });
+    if (res?.success && res.data?.did) {
+      return res.data.did;
+    }
+  }
+  if (typeof (agent as any).getProfile === "function") {
+    const profile = await agent.getProfile({ actor: cleaned });
+    if (profile?.success && profile.data?.did) {
+      return profile.data.did;
+    }
+  }
+  throw new Error(`Could not resolve user handle to DID: ${user}`);
+}
+
+/**
+ * Resolve a conversation ID either directly from `convoId` or by looking up / creating
+ * a 1:1 conversation with `user` via `chat.bsky.convo.getConvoForMembers`.
+ */
+async function resolveConvo(
+  agent: Agent,
+  chatAgent: Agent,
+  convoId?: string,
+  user?: string
+): Promise<{ convoId: string; convo?: any }> {
+  if (convoId && convoId.trim()) {
+    return { convoId: convoId.trim() };
+  }
+  if (user && user.trim()) {
+    const targetDid = await resolveUserDid(agent, user);
+    const res = await chatAgent.chat.bsky.convo.getConvoForMembers({
+      members: [targetDid],
+    });
+    if (!res?.success || !res.data?.convo?.id) {
+      throw new Error(`Could not find or create a DM conversation with ${user} (${targetDid}).`);
+    }
+    return { convoId: res.data.convo.id, convo: res.data.convo };
+  }
+  throw new Error("Provide either 'convoId' or 'user' (handle or DID) to identify the conversation.");
+}
+
+function formatDmSender(did: string | undefined, memberMap: Map<string, any>, selfDid?: string): string {
+  if (!did) return "Unknown sender";
+  const member = memberMap.get(did);
+  const youSuffix = selfDid && did === selfDid ? " [You]" : "";
+  if (member) {
+    const display = member.displayName ? `${member.displayName} ` : "";
+    const handle = member.handle ? `@${member.handle}` : did;
+    return `${display}(${handle})${youSuffix}`;
+  }
+  return `${did}${youSuffix}`;
+}
+
+function formatDmParticipants(members: any[] | undefined, selfDid?: string): string {
+  if (!members || members.length === 0) return "Unknown participants";
+  const others = selfDid ? members.filter((m) => m.did !== selfDid) : members;
+  const list = others.length > 0 ? others : members;
+  return list
+    .map((m) => {
+      const display = m.displayName ? `${m.displayName} ` : "";
+      const handle = m.handle ? `@${m.handle}` : m.did;
+      const disabled = m.chatDisabled ? " [chatDisabled]" : "";
+      return `${display}(${handle}, ${m.did})${disabled}`;
+    })
+    .join(", ");
+}
+
+function formatDmMessage(msg: any, memberMap: Map<string, any>, selfDid?: string, indent: string = ""): string {
+  if (!msg) return `${indent}None`;
+  const senderLabel = formatDmSender(msg.sender?.did, memberMap, selfDid);
+  const sentAt = msg.sentAt || "unknown time";
+  const isDeleted =
+    msg.$type === "chat.bsky.convo.defs#deletedMessageView" ||
+    (typeof msg.$type === "string" && msg.$type.endsWith("#deletedMessageView"));
+
+  if (isDeleted) {
+    return `${indent}[${sentAt}] ${senderLabel} (Message ID: ${msg.id})\n${indent}  [Message deleted]`;
+  }
+
+  const text = facetsToMarkdown(msg.text || "", msg.facets);
+  const lines: string[] = [
+    `${indent}[${sentAt}] ${senderLabel} (Message ID: ${msg.id})`,
+    `${indent}  ${text || "(no text)"}`,
+  ];
+
+  if (msg.embed) {
+    const rec = (msg.embed as any).record;
+    const embeddedUri = rec?.uri || rec?.record?.uri;
+    const embeddedAuthor = rec?.author?.handle ? `@${rec.author.handle}` : undefined;
+    const embeddedText = rec?.value?.text;
+    if (embeddedUri) {
+      let embedSummary = `${indent}  Embedded Post: ${embeddedUri}`;
+      if (embeddedAuthor) embedSummary += ` by ${embeddedAuthor}`;
+      if (embeddedText) embedSummary += ` — "${embeddedText}"`;
+      lines.push(embedSummary);
+    }
+  }
+
+  if (Array.isArray(msg.reactions) && msg.reactions.length > 0) {
+    const reactionList = msg.reactions
+      .map((r: any) => `${r.value} (${formatDmSender(r.sender?.did, memberMap, selfDid)})`)
+      .join(", ");
+    lines.push(`${indent}  Reactions: ${reactionList}`);
+  }
+
+  return lines.join("\n");
+}
 
 /**
  * Register all Bluesky MCP tools on the provided server.
@@ -152,6 +286,30 @@ export function registerTools(server: any, getAgent: AgentProvider): void {
     'list-resources': {
       title: 'List Resources',
       annotations: { readOnlyHint: true },
+    },
+    'list-dm-conversations': {
+      title: 'List DM Conversations',
+      annotations: { readOnlyHint: true },
+    },
+    'get-dm-messages': {
+      title: 'Get DM Messages',
+      annotations: { readOnlyHint: true },
+    },
+    'send-dm': {
+      title: 'Send DM',
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+    },
+    'manage-dm-conversation': {
+      title: 'Manage DM Conversation',
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+    },
+    'react-to-dm': {
+      title: 'React to DM',
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+    },
+    'delete-dm-message': {
+      title: 'Delete DM Message',
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true },
     },
   };
 
@@ -1991,6 +2149,430 @@ Description: ${resource.description}
       }).join("\n\n");
 
       return mcpSuccessResponse(`Available MCP Resources:\n\n${formattedResources}\n\nTo use these resources, reference them by URI in your prompts or queries.`);
+    }
+  );
+
+  registerTool(
+    "list-dm-conversations",
+    "List direct message (DM) conversations for the authenticated user, with optional filters for unread messages or message requests.",
+    {
+      limit: z.number().min(1).max(100).default(50).describe("Maximum number of conversations to fetch (1-100, default 50)"),
+      readState: z.enum(["all", "unread"]).default("all").describe("Filter conversations by read state: 'all' or 'unread' only"),
+      status: z.enum(["all", "accepted", "request"]).default("all").describe("Filter by conversation status: 'all', 'accepted', or 'request' (message requests)"),
+      cursor: z.string().optional().describe("Pagination cursor from a previous list-dm-conversations response"),
+    },
+    async ({ limit = 50, readState = "all", status = "all", cursor }) => {
+      const agent = getAgent();
+      if (!agent) {
+        return mcpErrorResponse("Not connected to Bluesky. Check your environment variables.");
+      }
+
+      try {
+        const chatAgent = getChatAgent(agent);
+        const queryParams: Record<string, any> = { limit };
+        if (cursor) queryParams.cursor = cursor;
+        if (readState === "unread") queryParams.readState = "unread";
+        if (status !== "all") queryParams.status = status;
+
+        const response = await chatAgent.chat.bsky.convo.listConvos(queryParams);
+        if (!response.success) {
+          return mcpErrorResponse("Failed to list DM conversations.");
+        }
+
+        const { convos, cursor: nextCursor } = response.data;
+        if (!convos || convos.length === 0) {
+          const filters: string[] = [];
+          if (readState !== "all") filters.push(`readState=${readState}`);
+          if (status !== "all") filters.push(`status=${status}`);
+          const filterSuffix = filters.length > 0 ? ` matching (${filters.join(", ")})` : "";
+          return mcpSuccessResponse(`No DM conversations found${filterSuffix}.`);
+        }
+
+        const formattedConvos = convos.map((convo: any, idx: number) => {
+          const memberMap = new Map<string, any>();
+          for (const m of convo.members || []) {
+            if (m?.did) memberMap.set(m.did, m);
+          }
+
+          const participants = formatDmParticipants(convo.members, agent.did);
+          const statusStr = convo.status || "accepted";
+          const unreadStr = convo.unreadCount > 0 ? `${convo.unreadCount} unread` : "0 unread";
+          const mutedStr = convo.muted ? "Yes" : "No";
+          const lastMsgStr = convo.lastMessage
+            ? `\nLast Message:\n${formatDmMessage(convo.lastMessage, memberMap, agent.did, "  ")}`
+            : "\nLast Message: None";
+
+          return `Conversation #${idx + 1}:
+Convo ID: ${convo.id}
+Participants: ${participants}
+Status: ${statusStr} | Unread: ${unreadStr} | Muted: ${mutedStr}${lastMsgStr}
+---`;
+        }).join("\n\n");
+
+        const summary = `Retrieved ${convos.length} DM conversation(s).${nextCursor ? ` More conversations available — pass cursor="${nextCursor}" to continue.` : ""}`;
+        return mcpSuccessResponse(`${summary}\n\n${formattedConvos}`);
+      } catch (error) {
+        return mcpErrorResponse(`Error listing DM conversations: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  );
+
+  registerTool(
+    "get-dm-messages",
+    "Get direct messages from a conversation, specified by either convoId or a participant's handle/DID. Messages are displayed in chronological order (oldest to newest within the page).",
+    {
+      convoId: z.string().optional().describe("The ID of the DM conversation. Provide either convoId or user."),
+      user: z.string().optional().describe("The handle or DID of the user whose DM conversation to read (e.g., alice.bsky.social). Used if convoId is not provided."),
+      limit: z.number().min(1).max(100).default(50).describe("Maximum number of messages to retrieve (1-100, default 50)"),
+      cursor: z.string().optional().describe("Pagination cursor from a previous get-dm-messages call to fetch older messages"),
+      markRead: z.boolean().optional().default(false).describe("Whether to mark the conversation as read after fetching messages (default: false)"),
+    },
+    async ({ convoId, user, limit = 50, cursor, markRead = false }) => {
+      const agent = getAgent();
+      if (!agent) {
+        return mcpErrorResponse("Not connected to Bluesky. Check your environment variables.");
+      }
+
+      if ((!convoId || !convoId.trim()) && (!user || !user.trim())) {
+        return mcpErrorResponse("Provide either 'convoId' or 'user' (handle or DID) to fetch DM messages.");
+      }
+
+      try {
+        const chatAgent = getChatAgent(agent);
+        const resolved = await resolveConvo(agent, chatAgent, convoId, user);
+        const targetConvoId = resolved.convoId;
+        let convo = resolved.convo;
+
+        if (!convo && typeof chatAgent.chat?.bsky?.convo?.getConvo === "function") {
+          try {
+            const convoRes = await chatAgent.chat.bsky.convo.getConvo({ convoId: targetConvoId });
+            if (convoRes?.success) {
+              convo = convoRes.data.convo;
+            }
+          } catch {
+            // Non-fatal: continue even if convo metadata cannot be hydrated
+          }
+        }
+
+        const memberMap = new Map<string, any>();
+        for (const m of convo?.members || []) {
+          if (m?.did) memberMap.set(m.did, m);
+        }
+
+        const msgRes = await chatAgent.chat.bsky.convo.getMessages({
+          convoId: targetConvoId,
+          limit,
+          cursor,
+        });
+
+        if (!msgRes.success) {
+          return mcpErrorResponse(`Failed to retrieve messages for conversation ${targetConvoId}.`);
+        }
+
+        if (markRead && typeof chatAgent.chat?.bsky?.convo?.updateRead === "function") {
+          try {
+            await chatAgent.chat.bsky.convo.updateRead({ convoId: targetConvoId });
+          } catch {
+            // Non-fatal if markRead fails after reading messages
+          }
+        }
+
+        const { messages, cursor: nextCursor } = msgRes.data;
+        const headerLines: string[] = [`Convo ID: ${targetConvoId}`];
+        if (convo?.members) {
+          headerLines.push(`Participants: ${formatDmParticipants(convo.members, agent.did)}`);
+        }
+        if (convo?.status) {
+          headerLines.push(`Status: ${convo.status} | Unread: ${markRead ? 0 : (convo.unreadCount ?? 0)}`);
+        }
+
+        if (!messages || messages.length === 0) {
+          return mcpSuccessResponse(`${headerLines.join("\n")}\n\nNo messages in this conversation.`);
+        }
+
+        // API returns newest-first; reverse so reading flows oldest -> newest chronologically
+        const chronological = [...messages].reverse();
+        const formattedMessages = chronological
+          .map((m) => formatDmMessage(m, memberMap, agent.did))
+          .join("\n\n");
+
+        const cursorHint = nextCursor ? `\nOlder messages available — pass cursor="${nextCursor}" to fetch earlier history.` : "";
+        return mcpSuccessResponse(
+          `Retrieved ${messages.length} message(s) from conversation ${targetConvoId}.${cursorHint}\n${headerLines.join("\n")}\n\n${formattedMessages}`
+        );
+      } catch (error) {
+        return mcpErrorResponse(`Error fetching DM messages: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  );
+
+  registerTool(
+    "send-dm",
+    "Send or reply to a direct message (DM) on Bluesky. Specify the target conversation by convoId or by the recipient's user handle/DID. Supports rich text (links, @mentions, #hashtags) and optional post quoting.",
+    {
+      text: z.string().min(1).max(1000).describe("The text content of the direct message (1-1000 characters)"),
+      convoId: z.string().optional().describe("The conversation ID to send the message to. Provide either convoId or user."),
+      user: z.string().optional().describe("The handle or DID of the recipient (e.g., alice.bsky.social or did:plc:...). Used if convoId is not provided."),
+      quoteUri: z.string().optional().describe("Optional AT URI or Bluesky web URL of a post to embed/share in the DM"),
+    },
+    async ({ text, convoId, user, quoteUri }) => {
+      const agent = getAgent();
+      if (!agent) {
+        return mcpErrorResponse("Not connected to Bluesky. Check your environment variables.");
+      }
+
+      if (!text || !text.trim()) {
+        return mcpErrorResponse("Message text cannot be empty.");
+      }
+
+      if ((!convoId || !convoId.trim()) && (!user || !user.trim())) {
+        return mcpErrorResponse("Provide either 'convoId' or 'user' (handle or DID) to specify the DM recipient.");
+      }
+
+      try {
+        const chatAgent = getChatAgent(agent);
+        const { convoId: targetConvoId } = await resolveConvo(agent, chatAgent, convoId, user);
+
+        const rt = new RichText({ text });
+        try {
+          await rt.detectFacets(agent);
+        } catch {
+          // If facet resolution fails (e.g. unresolvable handle), send plain text
+        }
+
+        const messageInput: Record<string, any> = {
+          text: rt.text,
+        };
+
+        if (rt.facets && rt.facets.length > 0) {
+          messageInput.facets = rt.facets;
+        }
+
+        if (quoteUri && quoteUri.trim()) {
+          let targetUri = quoteUri.trim();
+          if (targetUri.startsWith("http://") || targetUri.startsWith("https://")) {
+            const converted = await convertBskyUrlToAtUri(targetUri, agent);
+            if (!converted) {
+              return mcpErrorResponse(`Failed to convert post URL to AT URI: ${quoteUri}`);
+            }
+            targetUri = converted;
+          }
+          const threadRes = await agent.app.bsky.feed.getPostThread({ uri: targetUri });
+          const post = (threadRes?.data?.thread as any)?.post;
+          if (!threadRes?.success || !post?.cid) {
+            return mcpErrorResponse(`Could not resolve post to embed: ${quoteUri}`);
+          }
+          messageInput.embed = {
+            $type: "app.bsky.embed.record",
+            record: {
+              uri: targetUri,
+              cid: post.cid,
+            },
+          };
+        }
+
+        const res = await chatAgent.chat.bsky.convo.sendMessage({
+          convoId: targetConvoId,
+          message: messageInput as any,
+        });
+
+        if (!res.success) {
+          return mcpErrorResponse(`Failed to send DM to conversation ${targetConvoId}.`);
+        }
+
+        const sent = res.data;
+        return mcpSuccessResponse(
+          `DM sent successfully!\nConvo ID: ${targetConvoId}\nMessage ID: ${sent.id}\nSent At: ${sent.sentAt}\nText: ${sent.text}`
+        );
+      } catch (error) {
+        return mcpErrorResponse(`Error sending DM: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  );
+
+  registerTool(
+    "manage-dm-conversation",
+    "Manage a Bluesky DM conversation: mark as read, mark all conversations as read, accept a message request, leave a conversation, or mute/unmute notifications.",
+    {
+      action: z
+        .enum(["mark-read", "mark-all-read", "accept", "leave", "mute", "unmute"])
+        .describe("Action to perform: 'mark-read', 'mark-all-read', 'accept' (accept message request), 'leave', 'mute', or 'unmute'"),
+      convoId: z
+        .string()
+        .optional()
+        .describe("The conversation ID (required for all actions except 'mark-all-read', unless user is provided)"),
+      user: z
+        .string()
+        .optional()
+        .describe("Handle or DID of the user in the conversation, used if convoId is not provided"),
+      messageId: z
+        .string()
+        .optional()
+        .describe("Optional message ID up to which to mark as read (only used with 'mark-read')"),
+      status: z
+        .enum(["accepted", "request"])
+        .optional()
+        .describe("Optional conversation status filter when using 'mark-all-read' ('accepted' or 'request')"),
+    },
+    async ({ action, convoId, user, messageId, status }) => {
+      const agent = getAgent();
+      if (!agent) {
+        return mcpErrorResponse("Not connected to Bluesky. Check your environment variables.");
+      }
+
+      try {
+        const chatAgent = getChatAgent(agent);
+
+        if (action === "mark-all-read") {
+          const res = await chatAgent.chat.bsky.convo.updateAllRead(status ? { status } : {});
+          if (!res.success) {
+            return mcpErrorResponse("Failed to mark conversations as read.");
+          }
+          return mcpSuccessResponse(
+            `Marked all${status ? ` (${status})` : ""} conversations as read. Updated count: ${res.data.updatedCount}`
+          );
+        }
+
+        if ((!convoId || !convoId.trim()) && (!user || !user.trim())) {
+          return mcpErrorResponse(`Provide either 'convoId' or 'user' for action '${action}'.`);
+        }
+
+        const { convoId: targetConvoId } = await resolveConvo(agent, chatAgent, convoId, user);
+
+        switch (action) {
+          case "mark-read": {
+            const res = await chatAgent.chat.bsky.convo.updateRead({
+              convoId: targetConvoId,
+              ...(messageId ? { messageId } : {}),
+            });
+            if (!res.success) {
+              return mcpErrorResponse(`Failed to mark conversation ${targetConvoId} as read.`);
+            }
+            return mcpSuccessResponse(`Conversation ${targetConvoId} marked as read.`);
+          }
+          case "accept": {
+            const res = await chatAgent.chat.bsky.convo.acceptConvo({ convoId: targetConvoId });
+            if (!res.success) {
+              return mcpErrorResponse(`Failed to accept conversation ${targetConvoId}.`);
+            }
+            return mcpSuccessResponse(
+              `Conversation ${targetConvoId} accepted.${res.data.rev ? ` (rev: ${res.data.rev})` : " (already accepted)"}`
+            );
+          }
+          case "leave": {
+            const res = await chatAgent.chat.bsky.convo.leaveConvo({ convoId: targetConvoId });
+            if (!res.success) {
+              return mcpErrorResponse(`Failed to leave conversation ${targetConvoId}.`);
+            }
+            return mcpSuccessResponse(`Left conversation ${targetConvoId}.`);
+          }
+          case "mute": {
+            const res = await chatAgent.chat.bsky.convo.muteConvo({ convoId: targetConvoId });
+            if (!res.success) {
+              return mcpErrorResponse(`Failed to mute conversation ${targetConvoId}.`);
+            }
+            return mcpSuccessResponse(`Muted conversation ${targetConvoId}.`);
+          }
+          case "unmute": {
+            const res = await chatAgent.chat.bsky.convo.unmuteConvo({ convoId: targetConvoId });
+            if (!res.success) {
+              return mcpErrorResponse(`Failed to unmute conversation ${targetConvoId}.`);
+            }
+            return mcpSuccessResponse(`Unmuted conversation ${targetConvoId}.`);
+          }
+        }
+      } catch (error) {
+        return mcpErrorResponse(`Error managing DM conversation: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  );
+
+  registerTool(
+    "react-to-dm",
+    "Add or remove an emoji reaction on a direct message in a Bluesky conversation.",
+    {
+      messageId: z.string().min(1).describe("The ID of the direct message to react to"),
+      reaction: z.string().min(1).describe("The emoji reaction value (e.g., '❤️', '👍', '😂', '🔥')"),
+      convoId: z.string().optional().describe("The conversation ID containing the message. Provide either convoId or user."),
+      user: z.string().optional().describe("Handle or DID of the user in the conversation, used if convoId is not provided."),
+      remove: z.boolean().optional().default(false).describe("Set to true to remove the reaction instead of adding it (default: false)"),
+    },
+    async ({ messageId, reaction, convoId, user, remove = false }) => {
+      const agent = getAgent();
+      if (!agent) {
+        return mcpErrorResponse("Not connected to Bluesky. Check your environment variables.");
+      }
+
+      if ((!convoId || !convoId.trim()) && (!user || !user.trim())) {
+        return mcpErrorResponse("Provide either 'convoId' or 'user' (handle or DID) to identify the conversation.");
+      }
+
+      try {
+        const chatAgent = getChatAgent(agent);
+        const { convoId: targetConvoId } = await resolveConvo(agent, chatAgent, convoId, user);
+
+        if (remove) {
+          const res = await chatAgent.chat.bsky.convo.removeReaction({
+            convoId: targetConvoId,
+            messageId: messageId.trim(),
+            value: reaction,
+          });
+          if (!res.success) {
+            return mcpErrorResponse(`Failed to remove reaction ${reaction} from message ${messageId}.`);
+          }
+          return mcpSuccessResponse(`Removed reaction ${reaction} from message ${messageId} in conversation ${targetConvoId}.`);
+        } else {
+          const res = await chatAgent.chat.bsky.convo.addReaction({
+            convoId: targetConvoId,
+            messageId: messageId.trim(),
+            value: reaction,
+          });
+          if (!res.success) {
+            return mcpErrorResponse(`Failed to add reaction ${reaction} to message ${messageId}.`);
+          }
+          return mcpSuccessResponse(`Added reaction ${reaction} to message ${messageId} in conversation ${targetConvoId}.`);
+        }
+      } catch (error) {
+        return mcpErrorResponse(`Error updating DM reaction: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  );
+
+  registerTool(
+    "delete-dm-message",
+    "Delete a direct message from the authenticated user's view in a Bluesky conversation (deleteMessageForSelf).",
+    {
+      messageId: z.string().min(1).describe("The ID of the direct message to delete"),
+      convoId: z.string().optional().describe("The conversation ID containing the message. Provide either convoId or user."),
+      user: z.string().optional().describe("Handle or DID of the user in the conversation, used if convoId is not provided."),
+    },
+    async ({ messageId, convoId, user }) => {
+      const agent = getAgent();
+      if (!agent) {
+        return mcpErrorResponse("Not connected to Bluesky. Check your environment variables.");
+      }
+
+      if ((!convoId || !convoId.trim()) && (!user || !user.trim())) {
+        return mcpErrorResponse("Provide either 'convoId' or 'user' (handle or DID) to identify the conversation.");
+      }
+
+      try {
+        const chatAgent = getChatAgent(agent);
+        const { convoId: targetConvoId } = await resolveConvo(agent, chatAgent, convoId, user);
+
+        const res = await chatAgent.chat.bsky.convo.deleteMessageForSelf({
+          convoId: targetConvoId,
+          messageId: messageId.trim(),
+        });
+
+        if (!res.success) {
+          return mcpErrorResponse(`Failed to delete message ${messageId} in conversation ${targetConvoId}.`);
+        }
+
+        return mcpSuccessResponse(`Deleted message ${messageId} for yourself in conversation ${targetConvoId}.`);
+      } catch (error) {
+        return mcpErrorResponse(`Error deleting DM message: ${error instanceof Error ? error.message : String(error)}`);
+      }
     }
   );
 }

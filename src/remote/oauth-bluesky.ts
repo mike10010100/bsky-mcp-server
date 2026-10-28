@@ -7,13 +7,14 @@ import type { Storage } from "./storage.js";
  * Minimum scope set that covers every tool this server exposes. `atproto` is
  * mandatory. `transition:generic` is the current catch-all that grants
  * read+write on `app.bsky.*` collections (timeline, posts, likes, follows).
+ * `transition:chat.bsky` grants access to `chat.bsky.*` DM endpoints.
  *
  * ATProto is moving toward more granular scopes (`app.bsky.feed.post:write`
  * etc.) but the network hasn't fully rolled them out yet. Narrow this when
  * https://github.com/bluesky-social/proposals/tree/main/0004-oauth ships
  * finer-grained scopes.
  */
-export const BLUESKY_SCOPES = ["atproto", "transition:generic"] as const;
+export const BLUESKY_SCOPES = ["atproto", "transition:generic", "transition:chat.bsky"] as const;
 
 export interface BlueskyOAuthConfig {
   /** Public HTTPS URL where this server is reachable, no trailing slash. */

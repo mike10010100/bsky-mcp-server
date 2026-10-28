@@ -34,7 +34,15 @@ Here's the current list of tools provided:
 - **search-feeds**: returns feeds for a given query
 - **like-post**: like a post with a specific URI
 - **create-post**: publish a post 
+- **delete-post**: delete a post by URI or web URL
 - **follow-user**: follow a specific user
+- **unfollow-user**: unfollow a user by handle/DID or follow record URI
+- **list-dm-conversations**: list direct message (DM) conversations with optional unread or request filters
+- **get-dm-messages**: read messages from a DM conversation by `convoId` or participant handle/DID
+- **send-dm**: send or reply to a DM by `convoId` or recipient handle/DID (supports rich text links/mentions/hashtags and post quotes)
+- **manage-dm-conversation**: mark conversations as read (`mark-read`, `mark-all-read`), accept message requests (`accept`), `leave`, `mute`, or `unmute`
+- **react-to-dm**: add or remove an emoji reaction on a DM message
+- **delete-dm-message**: delete a DM message from your view (`deleteMessageForSelf`)
 
 Tips:
 - You can ask for post from search, timelines, lists, feeds, or profiles by time range. For example: Summarize posts from my timeline for the last three days" or "Find me the most interesting article people have been talking about this week"

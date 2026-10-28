@@ -30,6 +30,12 @@ const EXPECTED_TOOLS = [
   "get-followers",
   "get-post-likes",
   "list-resources",
+  "list-dm-conversations",
+  "get-dm-messages",
+  "send-dm",
+  "manage-dm-conversation",
+  "react-to-dm",
+  "delete-dm-message",
 ];
 
 async function harness(provider: AgentProvider) {
@@ -48,7 +54,7 @@ async function testExpectedToolSet() {
     const { tools } = await client.listTools();
     const names = tools.map(t => t.name).sort();
     assert.deepEqual(names, [...EXPECTED_TOOLS].sort(),
-      `registered tool set drifted from the 24 expected names`);
+      `registered tool set drifted from the 30 expected names`);
   } finally {
     await close();
   }
@@ -332,6 +338,203 @@ async function testToolAnnotations() {
     const handle = byName.get("get-my-handle-and-did");
     assert.ok(handle, "get-my-handle-and-did tool should exist");
     assert.equal(handle.annotations?.readOnlyHint, true, "get-my-handle-and-did should be readOnlyHint: true");
+
+    const listDms = byName.get("list-dm-conversations");
+    assert.ok(listDms, "list-dm-conversations tool should exist");
+    assert.equal(listDms.annotations?.readOnlyHint, true);
+
+    const sendDm = byName.get("send-dm");
+    assert.ok(sendDm, "send-dm tool should exist");
+    assert.equal(sendDm.annotations?.readOnlyHint, false);
+    assert.equal(sendDm.annotations?.destructiveHint, false);
+    assert.equal(sendDm.annotations?.idempotentHint, false);
+
+    const delDm = byName.get("delete-dm-message");
+    assert.ok(delDm, "delete-dm-message tool should exist");
+    assert.equal(delDm.annotations?.destructiveHint, true);
+    assert.equal(delDm.annotations?.idempotentHint, true);
+  } finally {
+    await close();
+  }
+}
+
+async function testDmToolsFlow() {
+  let proxyService: string | null = null;
+  let proxyDid: string | null = null;
+  let sentPayload: any = null;
+  let reactionAdded: any = null;
+  let reactionRemoved: any = null;
+  let deletedMsg: any = null;
+  let markedReadConvo: string | null = null;
+
+  const convoFixture = {
+    id: "convo-123",
+    rev: "rev-1",
+    members: [
+      { did: "did:plc:alice", handle: "alice.test", displayName: "Alice" },
+      { did: "did:plc:bob", handle: "bob.test", displayName: "Bob" },
+    ],
+    muted: false,
+    status: "accepted",
+    unreadCount: 1,
+    lastMessage: {
+      $type: "chat.bsky.convo.defs#messageView",
+      id: "msg-2",
+      rev: "r2",
+      text: "Latest message from Bob",
+      sender: { did: "did:plc:bob" },
+      sentAt: "2026-10-28T16:00:00.000Z",
+    },
+  };
+
+  const fakeAgent: any = {
+    did: "did:plc:alice",
+    withProxy: (serviceType: string, did: string) => {
+      proxyService = serviceType;
+      proxyDid = did;
+      return fakeAgent;
+    },
+    resolveHandle: async ({ handle }: { handle: string }) => ({
+      success: true,
+      data: { did: handle === "bob.test" ? "did:plc:bob" : "did:plc:unknown" },
+    }),
+    chat: {
+      bsky: {
+        convo: {
+          listConvos: async (params: any) => ({
+            success: true,
+            data: {
+              convos: params.readState === "unread" ? [convoFixture] : [convoFixture],
+              cursor: undefined,
+            },
+          }),
+          getConvoForMembers: async ({ members }: { members: string[] }) => ({
+            success: true,
+            data: {
+              convo: { ...convoFixture, id: members.includes("did:plc:bob") ? "convo-123" : "convo-other" },
+            },
+          }),
+          getConvo: async ({ convoId }: { convoId: string }) => ({
+            success: true,
+            data: { convo: { ...convoFixture, id: convoId } },
+          }),
+          getMessages: async ({ convoId }: { convoId: string }) => ({
+            success: true,
+            data: {
+              // API returns newest-first
+              messages: [
+                {
+                  $type: "chat.bsky.convo.defs#messageView",
+                  id: "msg-2",
+                  rev: "r2",
+                  text: "Second message (newer)",
+                  sender: { did: "did:plc:bob" },
+                  sentAt: "2026-10-28T16:00:00.000Z",
+                  reactions: [{ value: "👍", sender: { did: "did:plc:alice" }, createdAt: "2026-10-28T16:01:00.000Z" }],
+                },
+                {
+                  $type: "chat.bsky.convo.defs#messageView",
+                  id: "msg-1",
+                  rev: "r1",
+                  text: "First message (older)",
+                  sender: { did: "did:plc:alice" },
+                  sentAt: "2026-10-28T15:55:00.000Z",
+                },
+              ],
+            },
+          }),
+          sendMessage: async (input: any) => {
+            sentPayload = input;
+            return {
+              success: true,
+              data: {
+                id: "msg-3",
+                rev: "r3",
+                text: input.message.text,
+                sender: { did: "did:plc:alice" },
+                sentAt: "2026-10-28T16:05:00.000Z",
+              },
+            };
+          },
+          updateRead: async ({ convoId }: { convoId: string }) => {
+            markedReadConvo = convoId;
+            return { success: true, data: { convo: convoFixture } };
+          },
+          addReaction: async (input: any) => {
+            reactionAdded = input;
+            return { success: true, data: { message: {} } };
+          },
+          removeReaction: async (input: any) => {
+            reactionRemoved = input;
+            return { success: true, data: { message: {} } };
+          },
+          deleteMessageForSelf: async (input: any) => {
+            deletedMsg = input;
+            return { success: true, data: { id: input.messageId, rev: "r4", sender: { did: "did:plc:alice" }, sentAt: "" } };
+          },
+        },
+      },
+    },
+  };
+
+  const { client, close } = await harness(() => fakeAgent as Agent);
+  try {
+    // 1. list-dm-conversations uses bsky_chat proxy and formats convos
+    const listRes: any = await client.callTool({
+      name: "list-dm-conversations",
+      arguments: { readState: "unread" },
+    });
+    assert.equal(listRes.isError, undefined);
+    assert.equal(proxyService, "bsky_chat");
+    assert.equal(proxyDid, "did:web:api.bsky.chat");
+    assert.match(listRes.content[0].text, /convo-123/);
+    assert.match(listRes.content[0].text, /Bob \(@bob\.test, did:plc:bob\)/);
+    assert.match(listRes.content[0].text, /Latest message from Bob/);
+
+    // 2. get-dm-messages resolves user handle -> convoId and orders messages oldest -> newest
+    const msgRes: any = await client.callTool({
+      name: "get-dm-messages",
+      arguments: { user: "@bob.test", markRead: true },
+    });
+    assert.equal(msgRes.isError, undefined);
+    const msgText = msgRes.content[0].text as string;
+    const firstIdx = msgText.indexOf("First message (older)");
+    const secondIdx = msgText.indexOf("Second message (newer)");
+    assert.ok(firstIdx !== -1 && secondIdx !== -1 && firstIdx < secondIdx, "messages should be ordered oldest to newest");
+    assert.equal(markedReadConvo, "convo-123", "markRead=true should call updateRead");
+
+    // 3. send-dm resolves user handle -> convoId and sends message with RichText link facets
+    const sendRes: any = await client.callTool({
+      name: "send-dm",
+      arguments: { user: "bob.test", text: "Hello Bob! Check https://example.com" },
+    });
+    assert.equal(sendRes.isError, undefined);
+    assert.equal(sentPayload?.convoId, "convo-123");
+    assert.equal(sentPayload?.message?.text, "Hello Bob! Check https://example.com");
+    assert.ok(Array.isArray(sentPayload?.message?.facets) && sentPayload.message.facets.length > 0, "RichText link facet should be detected");
+
+    // 4. react-to-dm adds and removes reactions
+    const reactAddRes: any = await client.callTool({
+      name: "react-to-dm",
+      arguments: { convoId: "convo-123", messageId: "msg-2", reaction: "❤️" },
+    });
+    assert.equal(reactAddRes.isError, undefined);
+    assert.deepEqual(reactionAdded, { convoId: "convo-123", messageId: "msg-2", value: "❤️" });
+
+    const reactRemRes: any = await client.callTool({
+      name: "react-to-dm",
+      arguments: { convoId: "convo-123", messageId: "msg-2", reaction: "❤️", remove: true },
+    });
+    assert.equal(reactRemRes.isError, undefined);
+    assert.deepEqual(reactionRemoved, { convoId: "convo-123", messageId: "msg-2", value: "❤️" });
+
+    // 5. delete-dm-message calls deleteMessageForSelf
+    const delRes: any = await client.callTool({
+      name: "delete-dm-message",
+      arguments: { convoId: "convo-123", messageId: "msg-1" },
+    });
+    assert.equal(delRes.isError, undefined);
+    assert.deepEqual(deletedMsg, { convoId: "convo-123", messageId: "msg-1" });
   } finally {
     await close();
   }
@@ -339,7 +542,7 @@ async function testToolAnnotations() {
 
 async function main() {
   const cases: Array<[string, () => Promise<void>]> = [
-    ["registers exactly the expected 24 tools", testExpectedToolSet],
+    ["registers exactly the expected 30 tools", testExpectedToolSet],
     ["tools include MCP 2026-07-28 annotations (readOnly, destructive, idempotent hints)", testToolAnnotations],
     ["tools error out when getAgent returns null", testNullAgentReturnsError],
     ["getAgent is resolved per tool call, not cached", testAgentIsResolvedPerCall],
@@ -349,6 +552,7 @@ async function main() {
     ["unfollow-user rejects URIs that aren't the authed user's", testUnfollowRejectsForeignUri],
     ["unfollow-user with user scans listRecords for the rkey", testUnfollowByUserScansForRkey],
     ["delete-post invokes deletePost on agent", testDeletePostInvokesAgent],
+    ["DM tools proxy to bsky_chat, order messages chronologically, and send/react/delete", testDmToolsFlow],
   ];
 
   let failed = 0;
