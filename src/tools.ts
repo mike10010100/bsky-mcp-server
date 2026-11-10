@@ -1,15 +1,19 @@
 import { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
-import { Agent, RichText } from "@atproto/api";
+import { Agent, AtpAgent, RichText } from "@atproto/api";
 import fs from 'fs';
 import path from 'path';
 import {
   cleanHandle,
   facetsToMarkdown,
+  formatIsoTimestamp,
   formatSummaryText,
   getFeedNameFromId,
   validateUri,
   convertBskyUrlToAtUri,
+  isValidPostAtUri,
+  normalizePostUri,
+  resolvePdsEndpoint,
   extractFirstUrl,
   mcpErrorResponse,
   mcpSuccessResponse,
@@ -17,6 +21,258 @@ import {
 import { preprocessPosts, formatPostThread } from "./llm-preprocessor.js";
 import { resourcesList } from './resources.js';
 import { fetchLinkMetadata, uploadThumbnail } from './link-preview.js';
+
+/**
+ * Return the effective feed timestamp of an item (repost time for reposts, otherwise post createdAt/indexedAt).
+ */
+function getFeedItemTimestamp(item: any): Date | null {
+  const raw =
+    (item?.reason?.$type === 'app.bsky.feed.defs#reasonRepost' ? item.reason.indexedAt : undefined) ||
+    item?.post?.record?.createdAt ||
+    item?.post?.indexedAt;
+  if (!raw || typeof raw !== 'string') return null;
+  const d = new Date(raw);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+/**
+ * Resolve a post URI/URL to its canonical AT URI, CID, and PostView using lightweight getPosts
+ * (falling back to getPostThread when getPosts is not stubbed in unit tests).
+ */
+async function resolvePostTarget(
+  agent: Agent,
+  uriOrUrl: string,
+  handleCache?: Map<string, string>
+): Promise<{ uri: string; cid: string; post: any } | { error: string }> {
+  const normalized = await normalizePostUri(uriOrUrl, agent, handleCache);
+  if (!normalized) {
+    return {
+      error: `Invalid Bluesky post URI or URL: "${uriOrUrl}". Expected at://did:.../app.bsky.feed.post/... or https://bsky.app/profile/.../post/...`,
+    };
+  }
+
+  if (typeof agent.app?.bsky?.feed?.getPosts === 'function') {
+    const res = await agent.app.bsky.feed.getPosts({ uris: [normalized] });
+    if (res?.success && Array.isArray(res.data?.posts) && res.data.posts.length > 0) {
+      const p = res.data.posts[0];
+      if (p?.cid) {
+        return { uri: p.uri || normalized, cid: p.cid, post: p };
+      }
+    }
+    return { error: `Post not found (it may have been deleted): ${normalized}` };
+  }
+
+  if (typeof agent.app?.bsky?.feed?.getPostThread === 'function') {
+    const res = await agent.app.bsky.feed.getPostThread({ uri: normalized, depth: 0, parentHeight: 0 });
+    const post = (res?.data?.thread as any)?.post;
+    if (res?.success && post?.cid) {
+      return { uri: post.uri || normalized, cid: post.cid, post };
+    }
+  }
+
+  return { error: `Could not resolve post information for: ${normalized}` };
+}
+
+interface PostDraftInput {
+  text: string;
+  quoteUri?: string;
+  imagePaths?: string[];
+  imageAlts?: string[];
+  previewUrl?: string;
+  embedPreview?: boolean;
+}
+
+interface PreparedPostDraft {
+  text: string;
+  facets?: any[];
+  graphemeLength: number;
+  resolvedQuoteUri: string | null;
+  resolvedQuoteCid: string | null;
+  imagePaths: string[];
+  imageAlts: string[];
+  previewUrl?: string;
+  embedPreview: boolean;
+}
+
+/**
+ * Validate a single post's text (300 graphemes / 3000 UTF-8 bytes), image paths (<= 4 and exist on disk),
+ * and quote target (fail-closed if quoteUri is provided) BEFORE uploading blobs or publishing records.
+ */
+async function validateAndPreparePostDraft(
+  agent: Agent,
+  input: PostDraftInput,
+  handleCache?: Map<string, string>,
+  labelPrefix: string = 'Post'
+): Promise<{ draft: PreparedPostDraft } | { error: string }> {
+  const rt = new RichText({ text: input.text });
+  await rt.detectFacets(agent);
+
+  if (rt.graphemeLength > 300) {
+    return {
+      error: `${labelPrefix} exceeds Bluesky's 300-grapheme limit (${rt.graphemeLength} graphemes).`,
+    };
+  }
+  const byteLength = Buffer.byteLength(rt.text, 'utf8');
+  if (byteLength > 3000) {
+    return {
+      error: `${labelPrefix} exceeds Bluesky's 3000-byte UTF-8 limit (${byteLength} bytes).`,
+    };
+  }
+
+  const imagePaths = input.imagePaths ?? [];
+  if (imagePaths.length > 4) {
+    return {
+      error: `${labelPrefix} specifies ${imagePaths.length} images; Bluesky allows at most 4 images per post.`,
+    };
+  }
+  for (const imgPath of imagePaths) {
+    if (!fs.existsSync(imgPath)) {
+      return { error: `${labelPrefix} image file not found: ${imgPath}` };
+    }
+  }
+
+  let resolvedQuoteUri: string | null = null;
+  let resolvedQuoteCid: string | null = null;
+
+  if (input.quoteUri && input.quoteUri.trim()) {
+    const quoteTarget = await resolvePostTarget(agent, input.quoteUri, handleCache);
+    if ('error' in quoteTarget) {
+      return { error: `${labelPrefix} quoteUri failed: ${quoteTarget.error}` };
+    }
+    resolvedQuoteUri = quoteTarget.uri;
+    resolvedQuoteCid = quoteTarget.cid;
+  } else if (
+    input.previewUrl &&
+    input.previewUrl.includes('bsky.app/profile/') &&
+    input.previewUrl.includes('/post/')
+  ) {
+    const quoteTarget = await resolvePostTarget(agent, input.previewUrl, handleCache);
+    if ('error' in quoteTarget) {
+      return { error: `${labelPrefix} previewUrl Bluesky post lookup failed: ${quoteTarget.error}` };
+    }
+    resolvedQuoteUri = quoteTarget.uri;
+    resolvedQuoteCid = quoteTarget.cid;
+  }
+
+  return {
+    draft: {
+      text: rt.text,
+      facets: rt.facets && rt.facets.length > 0 ? rt.facets : undefined,
+      graphemeLength: rt.graphemeLength,
+      resolvedQuoteUri,
+      resolvedQuoteCid,
+      imagePaths,
+      imageAlts: input.imageAlts ?? [],
+      previewUrl: input.previewUrl,
+      embedPreview: input.embedPreview ?? true,
+    },
+  };
+}
+
+/**
+ * Materialize blobs/link cards and publish a validated post draft.
+ */
+async function publishPreparedPostDraft(
+  agent: Agent,
+  draft: PreparedPostDraft,
+  replyRefs?: { parent: { uri: string; cid: string }; root: { uri: string; cid: string } }
+): Promise<{
+  uri: string;
+  cid: string;
+  embedSummary: string;
+}> {
+  const record: any = {
+    text: draft.text,
+    createdAt: new Date().toISOString(),
+  };
+
+  if (draft.facets) {
+    record.facets = draft.facets;
+  }
+  if (replyRefs) {
+    record.reply = replyRefs;
+  }
+
+  let imagesEmbed: any = null;
+  if (draft.imagePaths.length > 0) {
+    const uploadedImages = [];
+    for (let i = 0; i < draft.imagePaths.length; i++) {
+      const imgPath = draft.imagePaths[i];
+      const mimeType = getMimeType(imgPath);
+      const imageBytes = await fs.promises.readFile(imgPath);
+      const uploadRes = await agent.uploadBlob(imageBytes, { encoding: mimeType });
+      if (!uploadRes.success) {
+        throw new Error(`Failed to upload image blob: ${imgPath}`);
+      }
+      uploadedImages.push({
+        image: uploadRes.data.blob,
+        alt: draft.imageAlts[i] || '',
+      });
+    }
+    imagesEmbed = {
+      $type: 'app.bsky.embed.images',
+      images: uploadedImages,
+    };
+  }
+
+  let embedSummary = 'none';
+  if (draft.resolvedQuoteUri && draft.resolvedQuoteCid && imagesEmbed) {
+    record.embed = {
+      $type: 'app.bsky.embed.recordWithMedia',
+      record: {
+        $type: 'app.bsky.embed.record',
+        record: {
+          uri: draft.resolvedQuoteUri,
+          cid: draft.resolvedQuoteCid,
+        },
+      },
+      media: imagesEmbed,
+    };
+    embedSummary = `recordWithMedia (quote ${draft.resolvedQuoteUri} + ${draft.imagePaths.length} image(s))`;
+  } else if (draft.resolvedQuoteUri && draft.resolvedQuoteCid) {
+    record.embed = {
+      $type: 'app.bsky.embed.record',
+      record: {
+        uri: draft.resolvedQuoteUri,
+        cid: draft.resolvedQuoteCid,
+      },
+    };
+    embedSummary = `record (quote ${draft.resolvedQuoteUri})`;
+  } else if (imagesEmbed) {
+    record.embed = imagesEmbed;
+    embedSummary = `images (${draft.imagePaths.length})`;
+  } else if (draft.embedPreview) {
+    const urlToPreview = draft.previewUrl || extractFirstUrl(draft.text);
+    if (urlToPreview) {
+      const metadata = await fetchLinkMetadata(urlToPreview);
+      if (metadata) {
+        const externalEmbed: any = {
+          $type: 'app.bsky.embed.external',
+          external: {
+            uri: metadata.url,
+            title: metadata.title,
+            description: metadata.description,
+          },
+        };
+        if (metadata.imageUrl) {
+          const thumbBlob = await uploadThumbnail(agent, metadata.imageUrl);
+          if (thumbBlob) {
+            externalEmbed.external.thumb = thumbBlob;
+          }
+        }
+        record.embed = externalEmbed;
+        embedSummary = `external (${metadata.url})`;
+      }
+    }
+  }
+
+  const response = await agent.post(record);
+  return {
+    uri: response.uri,
+    cid: response.cid,
+    embedSummary,
+  };
+}
 
 function getMimeType(filePath: string): string {
   const ext = path.extname(filePath).toLowerCase();
@@ -207,6 +463,10 @@ export function registerTools(server: any, getAgent: AgentProvider): void {
       title: 'Create Post',
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
     },
+    'create-thread': {
+      title: 'Create Thread',
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+    },
     'delete-post': {
       title: 'Delete Post',
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true },
@@ -219,8 +479,16 @@ export function registerTools(server: any, getAgent: AgentProvider): void {
       title: 'Search Posts',
       annotations: { readOnlyHint: true },
     },
+    'get-posts': {
+      title: 'Get Posts',
+      annotations: { readOnlyHint: true },
+    },
     'get-post-thread': {
       title: 'Get Post Thread',
+      annotations: { readOnlyHint: true },
+    },
+    'get-post-quotes': {
+      title: 'Get Post Quotes',
       annotations: { readOnlyHint: true },
     },
     'convert-url-to-uri': {
@@ -246,6 +514,18 @@ export function registerTools(server: any, getAgent: AgentProvider): void {
     'like-post': {
       title: 'Like Post',
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+    },
+    'unlike-post': {
+      title: 'Unlike Post',
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true },
+    },
+    'repost': {
+      title: 'Repost',
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+    },
+    'unrepost': {
+      title: 'Unrepost',
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true },
     },
     'follow-user': {
       title: 'Follow User',
@@ -367,32 +647,29 @@ export function registerTools(server: any, getAgent: AgentProvider): void {
     "Fetch your home timeline from Bluesky, which includes posts from all of the people you follow in reverse chronological order",
     {
       count: z.number().min(1).max(500).describe("Number of posts to fetch or hours to look back"),
-      type: z.enum(["posts", "hours"]).describe("Whether count represents number of posts or hours to look back")
+      type: z.enum(["posts", "hours"]).describe("Whether count represents number of posts or hours to look back"),
+      detail: z.enum(["compact", "full"]).default("compact").describe("Output verbosity: 'compact' (token-efficient, default) or 'full' (XML)"),
+      includeReposts: z.boolean().default(true).describe("Whether to include reposts in the returned timeline (default: true)"),
+      cursor: z.string().optional().describe("Optional pagination cursor returned by a previous get-timeline-posts call"),
     },
-    async ({ count, type }) => {
+    async ({ count, type, detail = "compact", includeReposts = true, cursor: initialCursor }) => {
       try {
         const agent = getAgent();
         if (!agent) {
           return mcpErrorResponse("Not connected to Bluesky. Check your environment variables.");
         }
 
-        const MAX_TOTAL_POSTS = 500; // Safety limit to prevent excessive API calls
-
+        const MAX_TOTAL_POSTS = 500;
         let allPosts: any[] = [];
-        let nextCursor: string | undefined = undefined;
+        let nextCursor: string | undefined = initialCursor;
         let shouldContinueFetching = true;
 
-        // Set up time-based or count-based fetching
         const useHoursLimit = type === "hours";
-        const targetHours = count;
-        const targetDate = new Date(Date.now() - targetHours * 60 * 60 * 1000);
+        const targetDate = new Date(Date.now() - count * 60 * 60 * 1000);
 
         while (shouldContinueFetching && allPosts.length < MAX_TOTAL_POSTS) {
-          // Calculate how many posts to fetch in this batch
-          const batchLimit = 100;
-
           const response = await agent.getTimeline({
-            limit: batchLimit,
+            limit: 100,
             cursor: nextCursor
           });
 
@@ -401,61 +678,52 @@ export function registerTools(server: any, getAgent: AgentProvider): void {
           }
 
           const { feed, cursor } = response.data;
+          if (!feed || feed.length === 0) {
+            nextCursor = undefined;
+            break;
+          }
 
-          // Filter posts based on time window if using hours limit
           let filteredFeed = feed;
+          if (!includeReposts) {
+            filteredFeed = filteredFeed.filter(
+              (item) => item?.reason?.$type !== 'app.bsky.feed.defs#reasonRepost'
+            );
+          }
           if (useHoursLimit) {
-            filteredFeed = feed.filter(post => {
-              const createdAt = post?.post?.record?.createdAt;
-              if (!createdAt || typeof createdAt !== 'string') return false;
-              const postDate = new Date(createdAt);
-              return postDate >= targetDate;
+            filteredFeed = filteredFeed.filter((item) => {
+              const d = getFeedItemTimestamp(item);
+              return d ? d >= targetDate : false;
             });
           }
 
-          // Add the filtered posts to our collection
           allPosts = allPosts.concat(filteredFeed);
-
-          // Update cursor for the next batch
           nextCursor = cursor;
 
-          // Check if we should continue fetching based on the mode
           if (useHoursLimit) {
-            // Check if we've reached posts older than our target date
-            const oldestPost = feed[feed.length - 1];
-            if (oldestPost?.post?.record?.createdAt && typeof oldestPost.post.record.createdAt === 'string') {
-              const postDate = new Date(oldestPost.post.record.createdAt);
-              if (postDate < targetDate) {
-                shouldContinueFetching = false;
-              }
+            const oldestDate = getFeedItemTimestamp(feed[feed.length - 1]);
+            if (oldestDate && oldestDate < targetDate) {
+              shouldContinueFetching = false;
             }
           } else {
-            // If we're using count-based fetching, stop when we have enough posts
             shouldContinueFetching = allPosts.length < count;
           }
 
-          // Stop if we don't have a cursor for the next page
           if (!cursor) {
             shouldContinueFetching = false;
           }
         }
 
-        // If we're using count-based fetching, limit the posts to the requested count
-        const finalPosts = !useHoursLimit
-          ? allPosts.slice(0, count)
-          : allPosts;
+        const finalPosts = !useHoursLimit ? allPosts.slice(0, count) : allPosts;
 
         if (finalPosts.length === 0) {
           return mcpSuccessResponse("Your timeline is empty.");
         }
 
-        // Format the posts
-        const timelineData = preprocessPosts(finalPosts);
-
-        const summaryText = formatSummaryText(finalPosts.length, "timeline");
+        const timelineData = preprocessPosts(finalPosts, { detail, includeReposts });
+        const cursorHint = nextCursor && !useHoursLimit ? ` More posts available — pass cursor="${nextCursor}" to continue.` : "";
+        const summaryText = `${formatSummaryText(finalPosts.length, "timeline")}${cursorHint}`;
 
         return mcpSuccessResponse(`${summaryText}\n\n${timelineData}`);
-
       } catch (error) {
         return mcpErrorResponse(`Error fetching timeline: ${error instanceof Error ? error.message : String(error)}`);
       }
@@ -464,7 +732,7 @@ export function registerTools(server: any, getAgent: AgentProvider): void {
 
   registerTool(
     "get-notifications",
-    "Fetch your notifications from Bluesky, optionally filtered by type (reply, mention, like, repost, follow, quote)",
+    "Fetch your notifications from Bluesky, optionally filtered by type (reply, mention, like, repost, follow, quote), author, time window, or reply status. Includes inline post text and reply/quote pointers so you don't need separate get-post-thread calls to triage.",
     {
       limit: z.number().min(1).max(500).default(50).describe("Number of notifications to fetch (1-500)"),
       reasons: z.array(z.enum([
@@ -477,54 +745,122 @@ export function registerTools(server: any, getAgent: AgentProvider): void {
         "starterpack-joined"
       ])).optional().describe("Filter by notification types (e.g., ['reply', 'mention']). If not provided, returns all types."),
       replyFilter: z.enum(["all", "responded", "unresponded"]).optional().default("all").describe("Filter reply notifications by response status. 'responded' shows only replies you've responded to, 'unresponded' shows only replies you haven't responded to. This filter only applies to notifications with reason 'reply'."),
-      authorFilter: z.string().optional().describe("Filter notifications by the handle or DID of the user who triggered them (e.g., 'alice.bsky.social').")
+      authorFilter: z.string().optional().describe("Filter notifications by the handle or DID of the user who triggered them (e.g., 'alice.bsky.social')."),
+      hours: z.number().min(0.1).max(720).optional().describe("Optional lookback window in hours (e.g., 24 for the last 24 hours)"),
+      since: z.string().optional().describe("Optional ISO-8601 timestamp cutoff; stops fetching notifications older than this time"),
+      cursor: z.string().optional().describe("Optional pagination cursor returned by a previous get-notifications call"),
     },
-    async ({ limit, reasons, replyFilter, authorFilter }) => {
+    async ({ limit, reasons, replyFilter = "all", authorFilter, hours, since, cursor: initialCursor }) => {
       const agent = getAgent();
       if (!agent) {
         return mcpErrorResponse("Not connected to Bluesky. Check your environment variables.");
       }
 
       try {
-        const MAX_NOTIFICATIONS = 500; // Safety limit
-        let matchedNotifications: any[] = [];
-        let nextCursor: string | undefined = undefined;
-        let shouldContinueFetching = true;
-
-        const targetAuthor = authorFilter ? (authorFilter.startsWith('@') ? authorFilter.substring(1) : authorFilter) : null;
-
-        // If filtering by response status, we need our own recent replies to compare
-        let repliedToUris = new Set<string>();
-        if (replyFilter !== "all") {
-          const myDid = agent.did;
-          if (!myDid) {
-            return mcpErrorResponse("Could not determine your DID. Are you authenticated?");
+        let cutoffDate: Date | null = null;
+        if (since) {
+          const parsed = new Date(since);
+          if (Number.isNaN(parsed.getTime())) {
+            return mcpErrorResponse(`Invalid ISO timestamp for 'since': ${since}`);
           }
-
-          // Fetch last 100 posts to see what we've replied to
-          // We use posts_with_replies to see where we've engaged
-          const myFeed = await agent.app.bsky.feed.getAuthorFeed({
-            actor: myDid,
-            limit: 100,
-            filter: 'posts_with_replies'
-          });
-
-          if (myFeed.success) {
-            for (const item of myFeed.data.feed) {
-              if (item.reply?.parent && 
-                  item.reply.parent.$type === 'app.bsky.feed.defs#postView' && 
-                  'uri' in item.reply.parent) {
-                repliedToUris.add((item.reply.parent as any).uri);
-              }
-            }
-          }
+          cutoffDate = parsed;
+        }
+        if (hours !== undefined) {
+          const hoursCutoff = new Date(Date.now() - hours * 60 * 60 * 1000);
+          cutoffDate = cutoffDate && cutoffDate > hoursCutoff ? cutoffDate : hoursCutoff;
         }
 
-        // If replyFilter is set but no reasons provided, default to 'reply'
+        const myDid = agent.did;
+        if (replyFilter !== "all" && !myDid) {
+          return mcpErrorResponse("Could not determine your DID. Are you authenticated?");
+        }
+
+        const targetAuthor = authorFilter ? cleanHandle(authorFilter.trim()).toLowerCase() : null;
         const effectiveReasons = (replyFilter !== "all" && (!reasons || reasons.length === 0)) ? ["reply"] : reasons;
 
-        while (shouldContinueFetching && matchedNotifications.length < limit && matchedNotifications.length < MAX_NOTIFICATIONS) {
-          // Fetch batches until we have enough matches
+        // Helper to lazily populate repliedToUris down to a target timestamp (paginating PDS records
+        // so high-volume accounts with >100 posts/reposts per day don't misclassify answered replies).
+        const repliedToUris = new Set<string>();
+        let scannedOwnRepliesOldestMs = Infinity;
+        let ownRepliesPaginationDone = false;
+        let ownRepliesCursor: string | undefined = undefined;
+        let ownRepliesPagesFetched = 0;
+        const MAX_OWN_REPLY_PAGES = 10; // Up to 1,000 authored posts
+
+        const ensureRepliedToUrisCover = async (targetOldestMs: number) => {
+          if (replyFilter === "all" || !myDid) return;
+          while (!ownRepliesPaginationDone && scannedOwnRepliesOldestMs > targetOldestMs && ownRepliesPagesFetched < MAX_OWN_REPLY_PAGES) {
+            ownRepliesPagesFetched += 1;
+            if (typeof agent.com?.atproto?.repo?.listRecords === "function") {
+              const res = await agent.com.atproto.repo.listRecords({
+                repo: myDid,
+                collection: "app.bsky.feed.post",
+                limit: 100,
+                cursor: ownRepliesCursor,
+              });
+              if (!res?.success || !res.data.records?.length) {
+                ownRepliesPaginationDone = true;
+                break;
+              }
+              for (const rec of res.data.records) {
+                const val = rec.value as any;
+                if (val?.reply?.parent?.uri) {
+                  repliedToUris.add(val.reply.parent.uri);
+                }
+                if (val?.createdAt) {
+                  const ms = new Date(val.createdAt).getTime();
+                  if (!Number.isNaN(ms) && ms < scannedOwnRepliesOldestMs) {
+                    scannedOwnRepliesOldestMs = ms;
+                  }
+                }
+              }
+              ownRepliesCursor = res.data.cursor;
+              if (!ownRepliesCursor) ownRepliesPaginationDone = true;
+            } else if (typeof agent.app?.bsky?.feed?.getAuthorFeed === "function") {
+              const myFeed = await agent.app.bsky.feed.getAuthorFeed({
+                actor: myDid,
+                limit: 100,
+                cursor: ownRepliesCursor,
+                filter: "posts_with_replies",
+              });
+              if (!myFeed?.success || !myFeed.data.feed?.length) {
+                ownRepliesPaginationDone = true;
+                break;
+              }
+              for (const item of myFeed.data.feed) {
+                const parentUri =
+                  (item.post?.record as any)?.reply?.parent?.uri ||
+                  (item.reply?.parent && 'uri' in item.reply.parent ? (item.reply.parent as any).uri : undefined);
+                if (parentUri) {
+                  repliedToUris.add(parentUri);
+                }
+                const ts = getFeedItemTimestamp(item);
+                if (ts && ts.getTime() < scannedOwnRepliesOldestMs) {
+                  scannedOwnRepliesOldestMs = ts.getTime();
+                }
+              }
+              ownRepliesCursor = myFeed.data.cursor;
+              if (!ownRepliesCursor) ownRepliesPaginationDone = true;
+            } else {
+              ownRepliesPaginationDone = true;
+            }
+          }
+        };
+
+        const MAX_NOTIFICATIONS = 500;
+        let matchedNotifications: any[] = [];
+        let nextCursor: string | undefined = initialCursor;
+        let shouldContinueFetching = true;
+        let pagesScanned = 0;
+        const MAX_SCAN_PAGES = 15;
+
+        while (
+          shouldContinueFetching &&
+          matchedNotifications.length < limit &&
+          matchedNotifications.length < MAX_NOTIFICATIONS &&
+          pagesScanned < MAX_SCAN_PAGES
+        ) {
+          pagesScanned += 1;
           const response = await agent.app.bsky.notification.listNotifications({
             limit: Math.max(50, Math.min(100, limit - matchedNotifications.length + 10)),
             cursor: nextCursor,
@@ -536,62 +872,121 @@ export function registerTools(server: any, getAgent: AgentProvider): void {
           }
 
           const { notifications, cursor } = response.data;
-          
-          // Apply filters
-          const filtered = notifications.filter(notif => {
-            // Apply author filter if provided
-            if (targetAuthor) {
-              if (notif.author.handle !== targetAuthor && notif.author.did !== targetAuthor) {
-                return false;
+          if (!notifications || notifications.length === 0) {
+            nextCursor = undefined;
+            break;
+          }
+
+          // Check if any replies exist in this batch and ensure our own reply scan covers this batch's age
+          if (replyFilter !== "all") {
+            let batchOldestReplyMs = Infinity;
+            for (const n of notifications) {
+              if (n.reason === "reply" && n.indexedAt) {
+                const ms = new Date(n.indexedAt).getTime();
+                if (!Number.isNaN(ms) && ms < batchOldestReplyMs) {
+                  batchOldestReplyMs = ms;
+                }
+              }
+            }
+            if (batchOldestReplyMs < Infinity) {
+              // Give 5 minutes of clock-skew margin
+              await ensureRepliedToUrisCover(batchOldestReplyMs - 5 * 60 * 1000);
+            }
+          }
+
+          let reachedCutoff = false;
+          const filtered: any[] = [];
+          for (const notif of notifications) {
+            if (cutoffDate && notif.indexedAt) {
+              const notifDate = new Date(notif.indexedAt);
+              if (!Number.isNaN(notifDate.getTime()) && notifDate < cutoffDate) {
+                reachedCutoff = true;
+                continue;
               }
             }
 
-            // If it's not a reply, only keep it if we're not filtering replies
-            // or if this reason was specifically requested in the original reasons
-            if (notif.reason !== 'reply') {
-              return replyFilter === 'all' || (reasons && reasons.includes(notif.reason as any));
+            if (targetAuthor) {
+              const h = (notif.author?.handle || "").toLowerCase();
+              const d = (notif.author?.did || "").toLowerCase();
+              if (h !== targetAuthor && d !== targetAuthor) {
+                continue;
+              }
             }
-            
-            // It's a reply, so apply the reply status filter
-            if (replyFilter === 'all') return true;
-            const isResponded = repliedToUris.has(notif.uri);
-            return replyFilter === 'responded' ? isResponded : !isResponded;
-          });
+
+            if (notif.reason !== "reply") {
+              if (replyFilter === "all" || (reasons && reasons.includes(notif.reason as any))) {
+                filtered.push(notif);
+              }
+              continue;
+            }
+
+            if (replyFilter === "all") {
+              filtered.push(notif);
+            } else {
+              const isResponded = repliedToUris.has(notif.uri);
+              if (replyFilter === "responded" ? isResponded : !isResponded) {
+                filtered.push(notif);
+              }
+            }
+          }
 
           matchedNotifications = matchedNotifications.concat(filtered);
           nextCursor = cursor;
 
-          // Stop if we have enough or no more results
-          shouldContinueFetching = matchedNotifications.length < limit && !!cursor;
+          if (reachedCutoff || !cursor) {
+            shouldContinueFetching = false;
+          } else {
+            shouldContinueFetching = matchedNotifications.length < limit;
+          }
         }
 
-        // Limit to requested count
         const finalNotifications = matchedNotifications.slice(0, limit);
 
         if (finalNotifications.length === 0) {
           const filterDesc = reasons ? ` with filter: ${reasons.join(', ')}` : '';
           const replyDesc = replyFilter !== 'all' ? ` and reply status: ${replyFilter}` : '';
           const authorDesc = authorFilter ? ` and author: ${authorFilter}` : '';
-          return mcpSuccessResponse(`No notifications found${filterDesc}${replyDesc}${authorDesc}.`);
+          const timeDesc = cutoffDate ? ` since ${cutoffDate.toISOString()}` : '';
+          return mcpSuccessResponse(`No notifications found${filterDesc}${replyDesc}${authorDesc}${timeDesc}.`);
         }
 
-        // Format notifications output
-        let output = `Retrieved ${finalNotifications.length} notification(s):\n\n`;
+        const cursorHint = nextCursor && matchedNotifications.length >= limit
+          ? ` More notifications available — pass cursor="${nextCursor}" to continue.`
+          : '';
+        let output = `Retrieved ${finalNotifications.length} notification(s):${cursorHint}\n\n`;
 
         for (const notif of finalNotifications) {
           const displayName = notif.author.displayName || notif.author.handle;
           let statusLabel = `[${notif.reason.toUpperCase()}]`;
-          
+
           if (notif.reason === 'reply' && replyFilter !== 'all') {
             statusLabel += ` [${repliedToUris.has(notif.uri) ? 'RESPONDED' : 'UNRESPONDED'}]`;
           }
-          
+
           output += `${statusLabel} ${displayName} (@${notif.author.handle})\n`;
           output += `  URI: ${notif.uri}\n`;
-          output += `  Time: ${notif.indexedAt}\n`;
+          if (typeof notif.uri === 'string' && notif.uri.includes('/app.bsky.feed.post/') && notif.author?.handle) {
+            const rkey = notif.uri.split('/').pop();
+            output += `  URL: https://bsky.app/profile/${notif.author.handle}/post/${rkey}\n`;
+          }
+          output += `  Time: ${formatIsoTimestamp(notif.indexedAt)}\n`;
           output += `  Read: ${notif.isRead}\n`;
           if (notif.reasonSubject) {
             output += `  Subject: ${notif.reasonSubject}\n`;
+          }
+          const rec = notif.record as any;
+          if (rec?.reply?.parent?.uri) {
+            output += `  Reply Parent: ${rec.reply.parent.uri}\n`;
+          }
+          if (rec?.embed) {
+            const quotedUri = rec.embed?.record?.uri || rec.embed?.record?.record?.uri;
+            if (quotedUri) {
+              output += `  Quoted Post: ${quotedUri}\n`;
+            }
+          }
+          if (typeof rec?.text === 'string' && rec.text.trim()) {
+            const formattedText = facetsToMarkdown(rec.text, rec.facets).replace(/\n+/g, '\n    ');
+            output += `  Text: ${formattedText}\n`;
           }
           output += `\n`;
         }
@@ -605,11 +1000,11 @@ export function registerTools(server: any, getAgent: AgentProvider): void {
 
   registerTool(
     "create-post",
-    "Create a new post on Bluesky, with support for replies, quote posts, images, and link previews",
+    "Create a new post on Bluesky, with support for replies, quote posts, images (including quote + images), and link previews. Enforces Bluesky's exact 300-grapheme limit and fails closed if quoteUri or replyTo cannot be resolved.",
     {
-      text: z.string().max(300).describe("The content of your post"),
-      replyTo: z.string().optional().describe("Optional URI or web URL of post to reply to"),
-      quoteUri: z.string().optional().describe("Optional AT URI or web URL of a post to quote (e.g. at://did:plc:.../app.bsky.feed.post/... or https://bsky.app/profile/.../post/...)"),
+      text: z.string().min(1).max(3000).describe("The content of your post (must be <= 300 graphemes and <= 3000 UTF-8 bytes)"),
+      replyTo: z.string().optional().describe("Optional AT URI or Bluesky web URL of the post to reply to"),
+      quoteUri: z.string().optional().describe("Optional AT URI or Bluesky web URL of a post to quote (fails closed if target post cannot be resolved)"),
       imagePaths: z.array(z.string()).optional().describe("Optional array of file paths to images (JPEG, PNG, GIF, WebP) to upload and attach (up to 4)"),
       imageAlts: z.array(z.string()).optional().describe("Optional alt text descriptions for the attached images"),
       previewUrl: z.string().url().optional().describe("Optional URL to generate preview card for. If not provided, uses first external URL detected in text."),
@@ -622,171 +1017,167 @@ export function registerTools(server: any, getAgent: AgentProvider): void {
       }
 
       try {
-        // Detect facets (mentions, links, hashtags) from the post text.
-        const rt = new RichText({ text });
-        await rt.detectFacets(agent);
+        const handleCache = new Map<string, string>();
+        let replyRefs: { parent: { uri: string; cid: string }; root: { uri: string; cid: string } } | undefined;
 
-        const record: any = {
-          text: rt.text,
-          createdAt: new Date().toISOString(),
-        };
-
-        if (rt.facets && rt.facets.length > 0) {
-          record.facets = rt.facets;
-        }
-
-        // 1. Handle reply format
-        if (replyTo) {
-          try {
-            let replyUri = replyTo.trim();
-            if (replyUri.startsWith('http://') || replyUri.startsWith('https://')) {
-              const converted = await convertBskyUrlToAtUri(replyUri, agent);
-              if (converted) replyUri = converted;
-            }
-
-            // Resolve the CID of the post we're replying to
-            const cidResponse = await agent.app.bsky.feed.getPostThread({ uri: replyUri });
-            if (!cidResponse.success) {
-              throw new Error('Could not get post information');
-            }
-
-            const threadPost = cidResponse.data.thread as any;
-            const parentPost = threadPost.post;
-            const parentCid = parentPost.cid;
-            const parentRecord = parentPost.record;
-
-            let rootUri: string;
-            let rootCid: string;
-            if (parentRecord.reply) {
-              rootUri = parentRecord.reply.root.uri;
-              rootCid = parentRecord.reply.root.cid;
-            } else {
-              rootUri = replyUri;
-              rootCid = parentCid;
-            }
-
-            record.reply = {
-              parent: { uri: replyUri, cid: parentCid },
-              root: { uri: rootUri, cid: rootCid }
-            };
-          } catch (error) {
-            return mcpErrorResponse(`Error parsing reply URI: ${error instanceof Error ? error.message : String(error)}`);
+        if (replyTo && replyTo.trim()) {
+          const parentTarget = await resolvePostTarget(agent, replyTo, handleCache);
+          if ('error' in parentTarget) {
+            return mcpErrorResponse(`Error resolving replyTo: ${parentTarget.error}`);
           }
-        }
-
-        // 2. Handle Quote Post resolution
-        let resolvedQuoteUri: string | null = null;
-        let resolvedQuoteCid: string | null = null;
-
-        if (quoteUri) {
-          let target = quoteUri.trim();
-          if (target.startsWith('http://') || target.startsWith('https://')) {
-            const converted = await convertBskyUrlToAtUri(target, agent);
-            if (converted) target = converted;
-          }
-          const threadRes = await agent.app.bsky.feed.getPostThread({ uri: target });
-          if (threadRes.success && (threadRes.data.thread as any)?.post) {
-            resolvedQuoteUri = target;
-            resolvedQuoteCid = (threadRes.data.thread as any).post.cid;
-          }
-        } else if (previewUrl && (previewUrl.includes('bsky.app/profile/') && previewUrl.includes('/post/'))) {
-          // Auto-detect Bluesky post URL passed as previewUrl
-          const converted = await convertBskyUrlToAtUri(previewUrl, agent);
-          if (converted) {
-            const threadRes = await agent.app.bsky.feed.getPostThread({ uri: converted });
-            if (threadRes.success && (threadRes.data.thread as any)?.post) {
-              resolvedQuoteUri = converted;
-              resolvedQuoteCid = (threadRes.data.thread as any).post.cid;
-            }
-          }
-        }
-
-        // 3. Handle Image Uploads
-        let imagesEmbed: any = null;
-        if (imagePaths && imagePaths.length > 0) {
-          const uploadedImages = [];
-          for (let i = 0; i < Math.min(imagePaths.length, 4); i++) {
-            const imgPath = imagePaths[i];
-            if (!fs.existsSync(imgPath)) {
-              return mcpErrorResponse(`Image file not found: ${imgPath}`);
-            }
-            const mimeType = getMimeType(imgPath);
-            const imageBytes = await fs.promises.readFile(imgPath);
-            const uploadRes = await agent.uploadBlob(imageBytes, { encoding: mimeType });
-            if (!uploadRes.success) {
-              return mcpErrorResponse(`Failed to upload image blob: ${imgPath}`);
-            }
-            uploadedImages.push({
-              image: uploadRes.data.blob,
-              alt: imageAlts?.[i] || ''
-            });
-          }
-          if (uploadedImages.length > 0) {
-            imagesEmbed = {
-              $type: 'app.bsky.embed.images',
-              images: uploadedImages
-            };
-          }
-        }
-
-        // 4. Construct Embed
-        if (resolvedQuoteUri && resolvedQuoteCid && imagesEmbed) {
-          // Quote Post with Media
-          record.embed = {
-            $type: 'app.bsky.embed.recordWithMedia',
-            record: {
-              $type: 'app.bsky.embed.record',
-              record: {
-                uri: resolvedQuoteUri,
-                cid: resolvedQuoteCid
-              }
-            },
-            media: imagesEmbed
+          const parentRecord = parentTarget.post?.record as any;
+          const rootUri = parentRecord?.reply?.root?.uri || parentTarget.uri;
+          const rootCid = parentRecord?.reply?.root?.cid || parentTarget.cid;
+          replyRefs = {
+            parent: { uri: parentTarget.uri, cid: parentTarget.cid },
+            root: { uri: rootUri, cid: rootCid },
           };
-        } else if (resolvedQuoteUri && resolvedQuoteCid) {
-          // Quote Post only
-          record.embed = {
-            $type: 'app.bsky.embed.record',
-            record: {
-              uri: resolvedQuoteUri,
-              cid: resolvedQuoteCid
-            }
-          };
-        } else if (imagesEmbed) {
-          // Images only
-          record.embed = imagesEmbed;
-        } else if (embedPreview) {
-          // External link preview
-          const urlToPreview = previewUrl || extractFirstUrl(text);
-          if (urlToPreview) {
-            const metadata = await fetchLinkMetadata(urlToPreview);
-            if (metadata) {
-              const externalEmbed: any = {
-                $type: 'app.bsky.embed.external',
-                external: {
-                  uri: metadata.url,
-                  title: metadata.title,
-                  description: metadata.description,
-                },
-              };
-
-              if (metadata.imageUrl) {
-                const thumbBlob = await uploadThumbnail(agent, metadata.imageUrl);
-                if (thumbBlob) {
-                  externalEmbed.external.thumb = thumbBlob;
-                }
-              }
-
-              record.embed = externalEmbed;
-            }
-          }
         }
 
-        const response = await agent.post(record);
+        const prepared = await validateAndPreparePostDraft(
+          agent,
+          { text, quoteUri, imagePaths, imageAlts, previewUrl, embedPreview },
+          handleCache,
+          "Post"
+        );
+        if ('error' in prepared) {
+          return mcpErrorResponse(prepared.error);
+        }
 
-        return mcpSuccessResponse(`Post created successfully! URI: ${response.uri}`);
+        const published = await publishPreparedPostDraft(agent, prepared.draft, replyRefs);
+        const rkey = published.uri.split('/').pop();
+        const actor = agent.did || published.uri.split('/')[2];
+        const webUrl = `https://bsky.app/profile/${actor}/post/${rkey}`;
+
+        const lines = [
+          `Post created successfully!`,
+          `URI: ${published.uri}`,
+          `CID: ${published.cid}`,
+          `URL: ${webUrl}`,
+          `Graphemes: ${prepared.draft.graphemeLength}/300`,
+          `Embed: ${published.embedSummary}`,
+        ];
+        if (replyRefs) {
+          lines.push(`Reply Parent: ${replyRefs.parent.uri}`);
+          lines.push(`Reply Root: ${replyRefs.root.uri}`);
+        }
+
+        return mcpSuccessResponse(lines.join('\n'));
       } catch (error) {
         return mcpErrorResponse(`Error creating post: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  );
+
+  registerTool(
+    "create-thread",
+    "Publish a multi-post Bluesky thread with pre-flight validation. Validates EVERY post's 300-grapheme limit, image file paths (<= 4 per post), and quoteUri targets BEFORE publishing post #1 so a bad post never leaves a half-published thread.",
+    {
+      posts: z.array(
+        z.object({
+          text: z.string().min(1).max(3000).describe("Post text (<= 300 graphemes)"),
+          quoteUri: z.string().optional().describe("Optional AT URI or web URL of a post to quote"),
+          imagePaths: z.array(z.string()).optional().describe("Optional image file paths (up to 4)"),
+          imageAlts: z.array(z.string()).optional().describe("Optional alt texts matching imagePaths"),
+          previewUrl: z.string().url().optional().describe("Optional external URL for link card preview"),
+          embedPreview: z.boolean().optional().default(true).describe("Whether to attach external link preview card when no quote or images are present"),
+        })
+      ).min(1).max(50).describe("Ordered array of posts in the thread (post #1 is the root unless replyTo is provided)"),
+      replyTo: z.string().optional().describe("Optional AT URI or web URL of an existing post to attach this thread under as a reply chain"),
+    },
+    async ({ posts, replyTo }) => {
+      const agent = getAgent();
+      if (!agent) {
+        return mcpErrorResponse("Not connected to Bluesky. Check your environment variables.");
+      }
+
+      try {
+        const handleCache = new Map<string, string>();
+        let initialRoot: { uri: string; cid: string } | null = null;
+        let currentParent: { uri: string; cid: string } | null = null;
+
+        if (replyTo && replyTo.trim()) {
+          const parentTarget = await resolvePostTarget(agent, replyTo, handleCache);
+          if ('error' in parentTarget) {
+            return mcpErrorResponse(`Error resolving replyTo: ${parentTarget.error}`);
+          }
+          const parentRecord = parentTarget.post?.record as any;
+          initialRoot = {
+            uri: parentRecord?.reply?.root?.uri || parentTarget.uri,
+            cid: parentRecord?.reply?.root?.cid || parentTarget.cid,
+          };
+          currentParent = { uri: parentTarget.uri, cid: parentTarget.cid };
+        }
+
+        // Phase 1: Validate all drafts BEFORE publishing anything
+        const preparedDrafts: PreparedPostDraft[] = [];
+        for (let i = 0; i < posts.length; i++) {
+          const res = await validateAndPreparePostDraft(agent, posts[i], handleCache, `Post #${i + 1}`);
+          if ('error' in res) {
+            return mcpErrorResponse(`Pre-flight validation failed (0 posts published): ${res.error}`);
+          }
+          preparedDrafts.push(res.draft);
+        }
+
+        // Phase 2: Sequential chained publishing
+        const publishedItems: Array<{
+          index: number;
+          uri: string;
+          cid: string;
+          url: string;
+          graphemes: number;
+          embedSummary: string;
+        }> = [];
+
+        for (let i = 0; i < preparedDrafts.length; i++) {
+          const draft = preparedDrafts[i];
+          const replyRefs =
+            currentParent && initialRoot
+              ? { parent: currentParent, root: initialRoot }
+              : undefined;
+
+          try {
+            const pub = await publishPreparedPostDraft(agent, draft, replyRefs);
+            if (!initialRoot) {
+              initialRoot = { uri: pub.uri, cid: pub.cid };
+            }
+            currentParent = { uri: pub.uri, cid: pub.cid };
+
+            const rkey = pub.uri.split('/').pop();
+            const actor = agent.did || pub.uri.split('/')[2];
+            publishedItems.push({
+              index: i + 1,
+              uri: pub.uri,
+              cid: pub.cid,
+              url: `https://bsky.app/profile/${actor}/post/${rkey}`,
+              graphemes: draft.graphemeLength,
+              embedSummary: pub.embedSummary,
+            });
+          } catch (stepErr) {
+            const partialList = publishedItems
+              .map((p) => `  #${p.index}: ${p.uri} (${p.url})`)
+              .join('\n');
+            return mcpErrorResponse(
+              `Error publishing Post #${i + 1} of ${preparedDrafts.length}: ${stepErr instanceof Error ? stepErr.message : String(stepErr)}\n` +
+                (publishedItems.length > 0
+                  ? `Already published (${publishedItems.length}):\n${partialList}`
+                  : `No posts were published.`)
+            );
+          }
+        }
+
+        const manifest = publishedItems
+          .map(
+            (p) =>
+              `#${p.index} (${p.graphemes}/300 graphemes, embed: ${p.embedSummary})\n  URI: ${p.uri}\n  CID: ${p.cid}\n  URL: ${p.url}`
+          )
+          .join('\n');
+
+        return mcpSuccessResponse(
+          `Thread published successfully (${publishedItems.length} post(s))!\nRoot URI: ${initialRoot?.uri}\n\n${manifest}`
+        );
+      } catch (error) {
+        return mcpErrorResponse(`Error creating thread: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
   );
@@ -795,7 +1186,7 @@ export function registerTools(server: any, getAgent: AgentProvider): void {
     "delete-post",
     "Delete a post on Bluesky using its AT URI or web URL",
     {
-      postUri: z.string().describe("The AT URI (at://did:plc:.../app.bsky.feed.post/...) or Bluesky web URL (https://bsky.app/profile/.../post/...) of the post to delete"),
+      postUri: z.string().describe("The AT URI (at://did:.../app.bsky.feed.post/...) or Bluesky web URL (https://bsky.app/profile/.../post/...) of the post to delete"),
     },
     async ({ postUri }) => {
       const agent = getAgent();
@@ -804,13 +1195,9 @@ export function registerTools(server: any, getAgent: AgentProvider): void {
       }
 
       try {
-        let uriToDelete = postUri.trim();
-        if (uriToDelete.startsWith('http://') || uriToDelete.startsWith('https://')) {
-          const converted = await convertBskyUrlToAtUri(uriToDelete, agent);
-          if (!converted) {
-            return mcpErrorResponse(`Failed to convert web URL to AT URI: ${postUri}`);
-          }
-          uriToDelete = converted;
+        const uriToDelete = await normalizePostUri(postUri, agent);
+        if (!uriToDelete) {
+          return mcpErrorResponse(`Invalid post URI or failed to convert web URL: ${postUri}`);
         }
 
         await agent.deletePost(uriToDelete);
@@ -825,7 +1212,7 @@ export function registerTools(server: any, getAgent: AgentProvider): void {
     "get-profile",
     "Get a user's profile from Bluesky",
     {
-      handle: z.string().describe("The handle of the user (e.g., alice.bsky.social)"),
+      handle: z.string().describe("The handle or DID of the user (e.g., alice.bsky.social)"),
     },
     async ({ handle }) => {
       const agent = getAgent();
@@ -859,43 +1246,61 @@ ${profile.labels?.length ? `Labels: ${profile.labels.map((l: any) => l.val).join
 
   registerTool(
     "search-posts",
-    "Search for posts on Bluesky. Note: Bluesky uses strict AND matching - all search terms must be present in a post for it to match. This differs from web search engines which use loose/fuzzy matching. Searching for 'a b c' requires ALL of a, b, AND c to appear in matching posts. Supported operators: from:handle, to:handle, mentions:handle, url:domain, lang:code (e.g., lang:en), has:images, has:video, has:link.",
+    "Search for posts on Bluesky. Note: Bluesky uses strict AND matching — all search terms must appear in a post. Supported query operators: from:handle, to:handle, mentions:handle, url:domain, lang:code, has:images, has:video, has:link. IMPORTANT: 'to:' and 'mentions:' only match explicit @handle text facets in post text, NOT replies in a thread that omit @handle in the body.",
     {
-      query: z.string().describe("Search query. Uses strict AND matching - all terms must match. Supported operators: from:, to:, mentions:, url:, lang:, has:images, has:video, has:link"),
+      query: z.string().describe("Search query (strict AND matching). Operators: from:, to:, mentions:, url:, lang:, has:images, has:video, has:link"),
       limit: z.number().min(1).max(100).default(50).describe("Number of results to fetch (1-100)"),
-      sort: z.enum(["top", "latest"]).default("top").describe("Sort order for search results - 'top' for most relevant or 'latest' for most recent"),
+      sort: z.enum(["top", "latest"]).default("top").describe("Sort order: 'top' (most relevant) or 'latest' (most recent)"),
+      since: z.string().optional().describe("Optional ISO-8601 start timestamp inclusive (e.g., '2026-11-10T00:00:00Z')"),
+      until: z.string().optional().describe("Optional ISO-8601 end timestamp exclusive (e.g., '2026-11-11T00:00:00Z')"),
+      author: z.string().optional().describe("Filter results to posts by this handle or DID"),
+      mentions: z.string().optional().describe("Filter results to posts explicitly @mentioning this handle or DID in text"),
+      domain: z.string().optional().describe("Filter results to posts linking to this domain (e.g., 'nytimes.com')"),
+      url: z.string().optional().describe("Filter results to posts linking to this exact URL"),
+      tag: z.array(z.string()).optional().describe("Filter by hashtag(s), without leading '#'"),
+      lang: z.string().optional().describe("Filter by 2-letter language code (e.g., 'en')"),
+      cursor: z.string().optional().describe("Pagination cursor returned by a previous search-posts call"),
+      detail: z.enum(["compact", "full"]).default("compact").describe("Output verbosity: 'compact' (token-efficient, default) or 'full' (XML)"),
     },
-    async ({ query, limit, sort }) => {
+    async ({ query, limit, sort, since, until, author, mentions, domain, url, tag, lang, cursor, detail = "compact" }) => {
       const agent = getAgent();
       if (!agent) {
         return mcpErrorResponse("Not logged in. Please check your environment variables.");
       }
 
       try {
-        const response = await agent.app.bsky.feed.searchPosts({ q: query, limit, sort });
+        const params: Record<string, any> = { q: query, limit, sort };
+        if (since) params.since = since;
+        if (until) params.until = until;
+        if (author) params.author = cleanHandle(author.trim());
+        if (mentions) params.mentions = cleanHandle(mentions.trim());
+        if (domain) params.domain = domain.trim();
+        if (url) params.url = url.trim();
+        if (tag && tag.length > 0) params.tag = tag.map((t: string) => t.replace(/^#/, ''));
+        if (lang) params.lang = lang.trim();
+        if (cursor) params.cursor = cursor;
+
+        const response = await agent.app.bsky.feed.searchPosts(params as any);
 
         if (!response.success) {
           return mcpErrorResponse("Failed to search posts.");
         }
 
-        const { posts } = response.data;
+        const { posts, cursor: nextCursor } = response.data;
 
-        if (posts.length === 0) {
+        if (!posts || posts.length === 0) {
           return mcpSuccessResponse(`No results found for query: "${query}"`);
         }
 
-        // Transform search posts to FeedViewPost format
         const feedViewPosts = posts.map(post => ({
           post: post,
           reply: undefined,
           reason: undefined
         }));
 
-        // Format the search results using preprocessPosts
-        const formattedPosts = preprocessPosts(feedViewPosts);
-
-        // Add summary information
-        const summaryText = formatSummaryText(posts.length, "search results");
+        const formattedPosts = preprocessPosts(feedViewPosts, { detail });
+        const cursorHint = nextCursor ? ` More results available — pass cursor="${nextCursor}" to continue.` : "";
+        const summaryText = `${formatSummaryText(posts.length, "search results")}${cursorHint}`;
 
         return mcpSuccessResponse(`${summaryText}\n\n${formattedPosts}`);
       } catch (error) {
@@ -905,39 +1310,162 @@ ${profile.labels?.length ? `Labels: ${profile.labels.map((l: any) => l.val).join
   );
 
   registerTool(
-    "get-post-thread",
-    "Get a full conversation thread for a specific post, showing replies and context",
+    "get-posts",
+    "Batch-hydrate 1 to 25 Bluesky posts in a single API call using their AT URIs or https://bsky.app/... web URLs. Returns full embeds (including quote + media), engagement counts, and explicitly reports any URIs that were deleted or not found.",
     {
-      uri: z.string().describe("URI of the post to fetch the thread for (e.g., at://did:plc:abcdef/app.bsky.feed.post/123)"),
+      uris: z.array(z.string()).min(1).max(25).describe("Array of 1-25 post AT URIs (at://did:.../app.bsky.feed.post/...) or web URLs (https://bsky.app/profile/.../post/...)"),
+      detail: z.enum(["compact", "full"]).default("compact").describe("Output verbosity: 'compact' (token-efficient, default) or 'full' (XML)"),
     },
-    async ({ uri }) => {
+    async ({ uris, detail = "compact" }) => {
       const agent = getAgent();
       if (!agent) {
         return mcpErrorResponse("Not logged in. Please check your environment variables.");
       }
 
       try {
-        // Validate the URI format
-        if (!uri.startsWith('at://did:plc:') || !uri.includes('/app.bsky.feed.post/')) {
-          return mcpErrorResponse("Invalid post URI format. Expected format: at://did:plc:abcdef/app.bsky.feed.post/123");
+        const handleCache = new Map<string, string>();
+        const normalizedUris: string[] = [];
+        const invalidInputs: string[] = [];
+
+        for (const raw of uris) {
+          const norm = await normalizePostUri(raw, agent, handleCache);
+          if (norm) {
+            normalizedUris.push(norm);
+          } else {
+            invalidInputs.push(raw);
+          }
+        }
+
+        if (normalizedUris.length === 0) {
+          return mcpErrorResponse(`None of the provided post URIs/URLs were valid: ${invalidInputs.join(', ')}`);
+        }
+
+        // Deduplicate for API call while preserving input order for output
+        const uniqueUris = Array.from(new Set(normalizedUris));
+        const res = await agent.app.bsky.feed.getPosts({ uris: uniqueUris });
+        if (!res.success) {
+          return mcpErrorResponse("Failed to fetch posts.");
+        }
+
+        const postByUri = new Map<string, any>();
+        for (const p of res.data.posts || []) {
+          if (p?.uri) postByUri.set(p.uri, p);
+        }
+
+        const foundItems: any[] = [];
+        const missingUris: string[] = [];
+        for (const u of uniqueUris) {
+          const p = postByUri.get(u);
+          if (p) {
+            foundItems.push({ post: p, reply: undefined, reason: undefined });
+          } else {
+            missingUris.push(u);
+          }
+        }
+
+        const headerParts: string[] = [`Hydrated ${foundItems.length}/${uniqueUris.length} requested post(s).`];
+        if (missingUris.length > 0) {
+          headerParts.push(`Not found / deleted (${missingUris.length}): ${missingUris.join(', ')}`);
+        }
+        if (invalidInputs.length > 0) {
+          headerParts.push(`Invalid inputs (${invalidInputs.length}): ${invalidInputs.join(', ')}`);
+        }
+
+        const body = foundItems.length > 0 ? `\n\n${preprocessPosts(foundItems, { detail })}` : '';
+        return mcpSuccessResponse(`${headerParts.join('\n')}${body}`);
+      } catch (error) {
+        return mcpErrorResponse(`Error fetching posts: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  );
+
+  registerTool(
+    "get-post-thread",
+    "Get a conversation thread for a specific post (accepts either an AT URI, including did:plc: and did:web:, or a https://bsky.app/... web URL), showing parent context and nested replies.",
+    {
+      uri: z.string().describe("AT URI (at://did:.../app.bsky.feed.post/...) or Bluesky web URL (https://bsky.app/profile/.../post/...) of the post"),
+      depth: z.number().min(0).max(100).default(6).describe("Levels of reply depth below the requested post to fetch (0-100, default 6)"),
+      parentHeight: z.number().min(0).max(100).default(20).describe("Number of ancestor parent posts above the requested post to fetch (0-100, default 20)"),
+      maxRepliesPerNode: z.number().min(1).max(200).optional().describe("Optional cap on direct replies rendered per post to keep viral threads concise"),
+      detail: z.enum(["compact", "full"]).default("full").describe("Output verbosity: 'full' (XML hierarchy, default) or 'compact' (indented text hierarchy)"),
+    },
+    async ({ uri, depth = 6, parentHeight = 20, maxRepliesPerNode, detail = "full" }) => {
+      const agent = getAgent();
+      if (!agent) {
+        return mcpErrorResponse("Not logged in. Please check your environment variables.");
+      }
+
+      try {
+        const normalizedUri = await normalizePostUri(uri, agent);
+        if (!normalizedUri) {
+          return mcpErrorResponse(
+            `Invalid post URI or URL: "${uri}". Expected at://did:.../app.bsky.feed.post/... or https://bsky.app/profile/.../post/...`
+          );
         }
 
         const response = await agent.app.bsky.feed.getPostThread({
-          uri,
-          depth: 100,
-          parentHeight: 100
+          uri: normalizedUri,
+          depth,
+          parentHeight
         });
 
         if (!response.success) {
           return mcpErrorResponse("Failed to fetch post thread.");
         }
 
-        // Process the thread structure and format it according to POST_FORMAT_SPEC
-        const threadData = formatPostThread(response.data.thread);
-
+        const threadData = formatPostThread(response.data.thread, { detail, maxRepliesPerNode });
         return mcpSuccessResponse(threadData);
       } catch (error) {
         return mcpErrorResponse(`Error fetching post thread: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  );
+
+  registerTool(
+    "get-post-quotes",
+    "Get posts that quote-post a specific Bluesky post (accepts AT URI or https://bsky.app/... web URL).",
+    {
+      uri: z.string().describe("AT URI or Bluesky web URL of the quoted post"),
+      limit: z.number().min(1).max(100).default(50).describe("Maximum quote-posts to fetch (1-100, default 50)"),
+      cursor: z.string().optional().describe("Optional pagination cursor returned by a previous get-post-quotes call"),
+      detail: z.enum(["compact", "full"]).default("compact").describe("Output verbosity: 'compact' (token-efficient, default) or 'full' (XML)"),
+    },
+    async ({ uri, limit = 50, cursor, detail = "compact" }) => {
+      const agent = getAgent();
+      if (!agent) {
+        return mcpErrorResponse("Not logged in. Please check your environment variables.");
+      }
+
+      try {
+        const normalizedUri = await normalizePostUri(uri, agent);
+        if (!normalizedUri) {
+          return mcpErrorResponse(
+            `Invalid post URI or URL: "${uri}". Expected at://did:.../app.bsky.feed.post/... or https://bsky.app/profile/.../post/...`
+          );
+        }
+
+        const res = await agent.app.bsky.feed.getQuotes({
+          uri: normalizedUri,
+          limit,
+          cursor,
+        });
+
+        if (!res.success) {
+          return mcpErrorResponse(`Failed to fetch quote posts for ${normalizedUri}.`);
+        }
+
+        const { posts, cursor: nextCursor } = res.data;
+        if (!posts || posts.length === 0) {
+          return mcpSuccessResponse(`No quote posts found for ${normalizedUri}.`);
+        }
+
+        const feedItems = posts.map((post: any) => ({ post, reply: undefined, reason: undefined }));
+        const formatted = preprocessPosts(feedItems, { detail });
+        const cursorHint = nextCursor ? ` More quotes available — pass cursor="${nextCursor}" to continue.` : "";
+
+        return mcpSuccessResponse(`Retrieved ${posts.length} quote post(s) for ${normalizedUri}.${cursorHint}\n\n${formatted}`);
+      } catch (error) {
+        return mcpErrorResponse(`Error fetching quote posts: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
   );
@@ -1066,34 +1594,30 @@ ${feed.indexedAt ? `Indexed At: ${new Date(feed.indexedAt).toLocaleString()}` : 
     "Get a list of posts that the authenticated user has liked",
     {
       limit: z.number().min(1).max(100).default(50).describe("Maximum number of liked posts to fetch (1-100)"),
+      cursor: z.string().optional().describe("Optional pagination cursor returned by a previous get-liked-posts call"),
+      detail: z.enum(["compact", "full"]).default("compact").describe("Output verbosity: 'compact' (token-efficient, default) or 'full' (XML)"),
     },
-    async ({ limit }) => {
+    async ({ limit, cursor: initialCursor, detail = "compact" }) => {
       const agent = getAgent();
       if (!agent) {
         return mcpErrorResponse("Not logged in. Please check your environment variables.");
       }
 
       try {
-        // We can only get likes for the authenticated user
         if (!agent.did) {
           return mcpErrorResponse("Not properly authenticated. Please check your credentials.");
         }
 
         const authenticatedUser = agent.did;
-
-        // Now fetch the authenticated user's likes with pagination
-        const MAX_BATCH_SIZE = 100; // Maximum number of likes per API call
-        const MAX_BATCHES = 5;      // Maximum number of API calls to make (100 x 5 = 500)
+        const MAX_BATCH_SIZE = 100;
+        const MAX_BATCHES = 5;
         let allLikes: any[] = [];
-        let nextCursor: string | undefined = undefined;
+        let nextCursor: string | undefined = initialCursor;
         let batchCount = 0;
 
-        // Loop to fetch likes with pagination
         while (batchCount < MAX_BATCHES && allLikes.length < limit) {
-          // Calculate how many likes to fetch in this batch
           const batchLimit = Math.min(MAX_BATCH_SIZE, limit - allLikes.length);
 
-          // Make the API call with cursor if we have one
           const response = await agent.app.bsky.feed.getActorLikes({
             actor: authenticatedUser,
             limit: batchLimit,
@@ -1101,7 +1625,6 @@ ${feed.indexedAt ? `Indexed At: ${new Date(feed.indexedAt).toLocaleString()}` : 
           });
 
           if (!response.success) {
-            // If we've already fetched some likes, return those
             if (allLikes.length > 0) {
               break;
             }
@@ -1109,15 +1632,10 @@ ${feed.indexedAt ? `Indexed At: ${new Date(feed.indexedAt).toLocaleString()}` : 
           }
 
           const { feed, cursor } = response.data;
-
-          // Add the fetched likes to our collection
           allLikes = allLikes.concat(feed);
-
-          // Update cursor for the next batch
           nextCursor = cursor;
           batchCount++;
 
-          // If no cursor returned or we've reached our limit, stop paginating
           if (!cursor || allLikes.length >= limit) {
             break;
           }
@@ -1127,14 +1645,11 @@ ${feed.indexedAt ? `Indexed At: ${new Date(feed.indexedAt).toLocaleString()}` : 
           return mcpSuccessResponse(`You haven't liked any posts.`);
         }
 
-        // Format the likes list using preprocessPosts
-        const formattedLikes = preprocessPosts(allLikes);
-
-        // Create a summary
-        const summaryText = formatSummaryText(allLikes.length, "liked posts");
+        const formattedLikes = preprocessPosts(allLikes, { detail });
+        const cursorHint = nextCursor ? ` More likes available — pass cursor="${nextCursor}" to continue.` : "";
+        const summaryText = `${formatSummaryText(allLikes.length, "liked posts")}${cursorHint}`;
 
         return mcpSuccessResponse(`${summaryText}\n\n${formattedLikes}`);
-
       } catch (error) {
         return mcpErrorResponse(`Error fetching likes: ${error instanceof Error ? error.message : String(error)}`);
       }
@@ -1155,9 +1670,8 @@ ${feed.indexedAt ? `Indexed At: ${new Date(feed.indexedAt).toLocaleString()}` : 
       }
 
       try {
-        // Call the unspecced API endpoint for trending topics
         const response = await agent.api.app.bsky.unspecced.getTrendingTopics({
-          limit: Math.min(50, limit) // API accepts up to 50 per call
+          limit: Math.min(50, limit)
         });
 
         if (!response.success) {
@@ -1170,9 +1684,8 @@ ${feed.indexedAt ? `Indexed At: ${new Date(feed.indexedAt).toLocaleString()}` : 
           return mcpSuccessResponse("No trending topics found at this time.");
         }
 
-        // Format trending topics
         const formattedTopics = topics.map((topic: any, index: number) => {
-          const startTime = new Date(topic.startTime).toLocaleString();
+          const startTime = formatIsoTimestamp(topic.startTime);
           return `#${index + 1}: ${topic.topic}
 Post Count: ${topic.postCount} posts
 Started Trending: ${startTime}
@@ -1180,7 +1693,6 @@ Feed Link: https://bsky.app${topic.link}
 ---`;
         }).join("\n\n");
 
-        // Format suggested topics if requested
         let suggestedContent = "";
         if (includeSuggested && suggested && suggested.length > 0) {
           const formattedSuggested = suggested.map((topic: any, index: number) => {
@@ -1201,9 +1713,9 @@ Feed Link: https://bsky.app${topic.link}
 
   registerTool(
     "like-post",
-    "Like a post on Bluesky",
+    "Like a post on Bluesky (accepts AT URI or https://bsky.app/... web URL)",
     {
-      uri: z.string().describe("The URI of the post to like"),
+      uri: z.string().describe("AT URI or Bluesky web URL of the post to like"),
     },
     async ({ uri }) => {
       const agent = getAgent();
@@ -1212,28 +1724,207 @@ Feed Link: https://bsky.app${topic.link}
       }
 
       try {
-        // First, we need to get the CID of the post
-        const parts = uri.split('/');
-        const repo = parts[2]; // The DID
-        const collection = parts[4]; // Usually app.bsky.feed.post
-        const rkey = parts[5]; // The record key
-
-        const response = await agent.app.bsky.feed.getPostThread({ uri });
-
-        if (!response.success || response.data.thread.$type !== 'app.bsky.feed.defs#threadViewPost') {
-          return mcpErrorResponse("Failed to get post information.");
+        const target = await resolvePostTarget(agent, uri);
+        if ('error' in target) {
+          return mcpErrorResponse(target.error);
         }
 
-        // Type assertion to tell TypeScript this is a post
-        const threadPost = response.data.thread as any;
-        const post = threadPost.post;
-        const cid = post.cid;
+        const existingLike = target.post?.viewer?.like;
+        if (existingLike) {
+          return mcpSuccessResponse(`Post already liked! Post URI: ${target.uri}\nLike Record URI: ${existingLike}`);
+        }
 
-        await agent.like(uri, cid);
-
-        return mcpSuccessResponse("Post liked successfully!");
+        const res = await agent.like(target.uri, target.cid);
+        const likeUri = res?.uri ? `\nLike Record URI: ${res.uri}` : '';
+        return mcpSuccessResponse(`Post liked successfully! Post URI: ${target.uri}${likeUri}`);
       } catch (error) {
         return mcpErrorResponse(`Error liking post: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  );
+
+  registerTool(
+    "unlike-post",
+    "Remove a like from a Bluesky post. Pass likeUri (the at://.../app.bsky.feed.like/... record URI) for a direct 1-call delete, or pass postUri (AT URI or web URL of the liked post) to look up and delete your like automatically.",
+    {
+      postUri: z.string().optional().describe("AT URI or Bluesky web URL of the post to unlike. Mutually exclusive with likeUri."),
+      likeUri: z.string().optional().describe("AT URI of your app.bsky.feed.like record (as returned by like-post). Mutually exclusive with postUri."),
+    },
+    async ({ postUri, likeUri }) => {
+      const agent = getAgent();
+      if (!agent) {
+        return mcpErrorResponse("Not logged in. Please check your environment variables.");
+      }
+      if (!agent.did) {
+        return mcpErrorResponse("Not authenticated.");
+      }
+      if (!postUri && !likeUri) {
+        return mcpErrorResponse("Provide either postUri or likeUri.");
+      }
+      if (postUri && likeUri) {
+        return mcpErrorResponse("Provide only one of postUri or likeUri, not both.");
+      }
+
+      try {
+        let uriToDelete = likeUri?.trim();
+
+        if (uriToDelete) {
+          const parts = uriToDelete.split('/');
+          if (!uriToDelete.startsWith('at://') || parts.length !== 5 || !parts[2] || !parts[4]) {
+            return mcpErrorResponse(`Invalid likeUri format: "${uriToDelete}". Expected at://<did>/app.bsky.feed.like/<rkey>.`);
+          }
+          if (parts[2] !== agent.did) {
+            return mcpErrorResponse(`likeUri belongs to ${parts[2]}, not the authenticated user (${agent.did}).`);
+          }
+          if (parts[3] !== 'app.bsky.feed.like') {
+            return mcpErrorResponse(`likeUri is a ${parts[3]} record, not app.bsky.feed.like.`);
+          }
+        } else {
+          const target = await resolvePostTarget(agent, postUri!);
+          if ('error' in target) {
+            return mcpErrorResponse(target.error);
+          }
+          uriToDelete = target.post?.viewer?.like;
+
+          if (!uriToDelete && typeof agent.com?.atproto?.repo?.listRecords === 'function') {
+            let cursor: string | undefined;
+            for (let page = 0; page < 5 && !uriToDelete; page++) {
+              const res = await agent.com.atproto.repo.listRecords({
+                repo: agent.did,
+                collection: 'app.bsky.feed.like',
+                limit: 100,
+                cursor,
+              });
+              if (!res.success || !res.data.records.length) break;
+              for (const r of res.data.records) {
+                if ((r.value as any)?.subject?.uri === target.uri) {
+                  uriToDelete = r.uri;
+                  break;
+                }
+              }
+              cursor = res.data.cursor;
+              if (!cursor) break;
+            }
+          }
+
+          if (!uriToDelete) {
+            return mcpSuccessResponse(`You have not liked ${target.uri}; nothing to unlike.`);
+          }
+        }
+
+        await agent.deleteLike(uriToDelete);
+        return mcpSuccessResponse(`Unliked post successfully! Deleted like record: ${uriToDelete}`);
+      } catch (error) {
+        return mcpErrorResponse(`Error unliking post: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  );
+
+  registerTool(
+    "repost",
+    "Repost a Bluesky post (accepts AT URI or https://bsky.app/... web URL)",
+    {
+      uri: z.string().describe("AT URI or Bluesky web URL of the post to repost"),
+    },
+    async ({ uri }) => {
+      const agent = getAgent();
+      if (!agent) {
+        return mcpErrorResponse("Not logged in. Please check your environment variables.");
+      }
+
+      try {
+        const target = await resolvePostTarget(agent, uri);
+        if ('error' in target) {
+          return mcpErrorResponse(target.error);
+        }
+
+        const existingRepost = target.post?.viewer?.repost;
+        if (existingRepost) {
+          return mcpSuccessResponse(`Post already reposted! Post URI: ${target.uri}\nRepost Record URI: ${existingRepost}`);
+        }
+
+        const res = await agent.repost(target.uri, target.cid);
+        const repostUri = res?.uri ? `\nRepost Record URI: ${res.uri}` : '';
+        return mcpSuccessResponse(`Post reposted successfully! Post URI: ${target.uri}${repostUri}`);
+      } catch (error) {
+        return mcpErrorResponse(`Error reposting post: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  );
+
+  registerTool(
+    "unrepost",
+    "Remove a repost from your Bluesky account. Pass repostUri (your at://.../app.bsky.feed.repost/... record URI) for a direct 1-call delete, or pass postUri (AT URI or web URL of the reposted post) to look up and remove your repost.",
+    {
+      postUri: z.string().optional().describe("AT URI or Bluesky web URL of the reposted post. Mutually exclusive with repostUri."),
+      repostUri: z.string().optional().describe("AT URI of your app.bsky.feed.repost record (as returned by repost). Mutually exclusive with postUri."),
+    },
+    async ({ postUri, repostUri }) => {
+      const agent = getAgent();
+      if (!agent) {
+        return mcpErrorResponse("Not logged in. Please check your environment variables.");
+      }
+      if (!agent.did) {
+        return mcpErrorResponse("Not authenticated.");
+      }
+      if (!postUri && !repostUri) {
+        return mcpErrorResponse("Provide either postUri or repostUri.");
+      }
+      if (postUri && repostUri) {
+        return mcpErrorResponse("Provide only one of postUri or repostUri, not both.");
+      }
+
+      try {
+        let uriToDelete = repostUri?.trim();
+
+        if (uriToDelete) {
+          const parts = uriToDelete.split('/');
+          if (!uriToDelete.startsWith('at://') || parts.length !== 5 || !parts[2] || !parts[4]) {
+            return mcpErrorResponse(`Invalid repostUri format: "${uriToDelete}". Expected at://<did>/app.bsky.feed.repost/<rkey>.`);
+          }
+          if (parts[2] !== agent.did) {
+            return mcpErrorResponse(`repostUri belongs to ${parts[2]}, not the authenticated user (${agent.did}).`);
+          }
+          if (parts[3] !== 'app.bsky.feed.repost') {
+            return mcpErrorResponse(`repostUri is a ${parts[3]} record, not app.bsky.feed.repost.`);
+          }
+        } else {
+          const target = await resolvePostTarget(agent, postUri!);
+          if ('error' in target) {
+            return mcpErrorResponse(target.error);
+          }
+          uriToDelete = target.post?.viewer?.repost;
+
+          if (!uriToDelete && typeof agent.com?.atproto?.repo?.listRecords === 'function') {
+            let cursor: string | undefined;
+            for (let page = 0; page < 5 && !uriToDelete; page++) {
+              const res = await agent.com.atproto.repo.listRecords({
+                repo: agent.did,
+                collection: 'app.bsky.feed.repost',
+                limit: 100,
+                cursor,
+              });
+              if (!res.success || !res.data.records.length) break;
+              for (const r of res.data.records) {
+                if ((r.value as any)?.subject?.uri === target.uri) {
+                  uriToDelete = r.uri;
+                  break;
+                }
+              }
+              cursor = res.data.cursor;
+              if (!cursor) break;
+            }
+          }
+
+          if (!uriToDelete) {
+            return mcpSuccessResponse(`You have not reposted ${target.uri}; nothing to unrepost.`);
+          }
+        }
+
+        await agent.deleteRepost(uriToDelete);
+        return mcpSuccessResponse(`Removed repost successfully! Deleted repost record: ${uriToDelete}`);
+      } catch (error) {
+        return mcpErrorResponse(`Error removing repost: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
   );
@@ -1242,7 +1933,7 @@ Feed Link: https://bsky.app${topic.link}
     "follow-user",
     "Follow a user on Bluesky",
     {
-      handle: z.string().describe("The handle of the user to follow"),
+      handle: z.string().describe("The handle or DID of the user to follow"),
     },
     async ({ handle }) => {
       const agent = getAgent();
@@ -1251,17 +1942,10 @@ Feed Link: https://bsky.app${topic.link}
       }
 
       try {
-        // Resolve the handle to a DID
-        const resolveResponse = await agent.resolveHandle({ handle: cleanHandle(handle) });
-
-        if (!resolveResponse.success) {
-          return mcpErrorResponse(`Failed to resolve handle: ${handle}`);
-        }
-
-        const did = resolveResponse.data.did;
+        const did = await resolveUserDid(agent, handle);
         await agent.follow(did);
 
-        return mcpSuccessResponse(`Successfully followed @${handle}`);
+        return mcpSuccessResponse(`Successfully followed ${handle.startsWith('did:') ? did : `@${cleanHandle(handle)}`}`);
       } catch (error) {
         return mcpErrorResponse(`Error following user: ${error instanceof Error ? error.message : String(error)}`);
       }
@@ -1487,43 +2171,39 @@ ${feed.purpose ? `Purpose: ${feed.purpose}` : ''}`;
 
   registerTool(
     "get-feed-posts",
-    "Fetch posts from a specified feed",
+    "Fetch posts from a specified custom feed",
     {
       feed: z.string().describe("The URI of the feed to fetch posts from (e.g., at://did:plc:abcdef/app.bsky.feed.generator/whats-hot)"),
       count: z.number().min(1).max(500).describe("Number of posts to fetch or hours to look back"),
-      type: z.enum(["posts", "hours"]).describe("Whether count represents number of posts or hours to look back")
+      type: z.enum(["posts", "hours"]).describe("Whether count represents number of posts or hours to look back"),
+      detail: z.enum(["compact", "full"]).default("compact").describe("Output verbosity: 'compact' (token-efficient, default) or 'full' (XML)"),
+      includeReposts: z.boolean().default(true).describe("Whether to include reposts (default: true)"),
+      cursor: z.string().optional().describe("Optional pagination cursor returned by a previous get-feed-posts call"),
     },
-    async ({ feed, count, type }) => {
+    async ({ feed, count, type, detail = "compact", includeReposts = true, cursor: initialCursor }) => {
       const agent = getAgent();
       if (!agent) {
         return mcpErrorResponse("Not connected to Bluesky. Check your environment variables.");
       }
 
       try {
-        // First, validate the feed by getting its info
         const feedInfo = await validateUri(agent, feed, 'feed');
         if (!feedInfo) {
           return mcpErrorResponse(`Invalid feed URI or feed not found: ${feed}.`);
         }
 
-        const MAX_TOTAL_POSTS = 500; // Safety limit to prevent excessive API calls
-
+        const MAX_TOTAL_POSTS = 500;
         let allPosts: any[] = [];
-        let nextCursor: string | undefined = undefined;
+        let nextCursor: string | undefined = initialCursor;
         let shouldContinueFetching = true;
 
-        // Set up time-based or count-based fetching
         const useHoursLimit = type === "hours";
-        const targetHours = count;
-        const targetDate = new Date(Date.now() - targetHours * 60 * 60 * 1000);
+        const targetDate = new Date(Date.now() - count * 60 * 60 * 1000);
 
         while (shouldContinueFetching && allPosts.length < MAX_TOTAL_POSTS) {
-          // Calculate how many posts to fetch in this batch
-          const batchLimit = 100;
-
           const response = await agent.app.bsky.feed.getFeed({
             feed,
-            limit: batchLimit,
+            limit: 100,
             cursor: nextCursor
           });
 
@@ -1532,60 +2212,50 @@ ${feed.purpose ? `Purpose: ${feed.purpose}` : ''}`;
           }
 
           const { feed: feedPosts, cursor } = response.data;
+          if (!feedPosts || feedPosts.length === 0) {
+            nextCursor = undefined;
+            break;
+          }
 
-          // Filter posts based on time window if using hours limit
           let filteredFeed = feedPosts;
+          if (!includeReposts) {
+            filteredFeed = filteredFeed.filter(
+              (item) => item?.reason?.$type !== 'app.bsky.feed.defs#reasonRepost'
+            );
+          }
           if (useHoursLimit) {
-            filteredFeed = feedPosts.filter(post => {
-              const createdAt = post?.post?.record?.createdAt;
-              if (!createdAt || typeof createdAt !== 'string') return false;
-              const postDate = new Date(createdAt);
-              return postDate >= targetDate;
+            filteredFeed = filteredFeed.filter((item) => {
+              const d = getFeedItemTimestamp(item);
+              return d ? d >= targetDate : false;
             });
           }
 
-          // Add the filtered posts to our collection
           allPosts = allPosts.concat(filteredFeed);
-
-          // Update cursor for the next batch
           nextCursor = cursor;
 
-          // Check if we should continue fetching based on the mode
           if (useHoursLimit) {
-            // Check if we've reached posts older than our target date
-            const oldestPost = feedPosts[feedPosts.length - 1];
-            if (oldestPost?.post?.record?.createdAt && typeof oldestPost.post.record.createdAt === 'string') {
-              const postDate = new Date(oldestPost.post.record.createdAt);
-              if (postDate < targetDate) {
-                shouldContinueFetching = false;
-              }
+            const oldestDate = getFeedItemTimestamp(feedPosts[feedPosts.length - 1]);
+            if (oldestDate && oldestDate < targetDate) {
+              shouldContinueFetching = false;
             }
           } else {
-            // If we're using count-based fetching, stop when we have enough posts
             shouldContinueFetching = allPosts.length < count;
           }
 
-          // Stop if we don't have a cursor for the next page
           if (!cursor) {
             shouldContinueFetching = false;
           }
         }
 
-        // If we're using count-based fetching, limit the posts to the requested count
-        const finalPosts = !useHoursLimit
-          ? allPosts.slice(0, count)
-          : allPosts;
+        const finalPosts = !useHoursLimit ? allPosts.slice(0, count) : allPosts;
 
-        // If no posts were found after filtering
         if (finalPosts.length === 0) {
           return mcpSuccessResponse(`No posts found in the feed: ${feed}`);
         }
 
-        // Format the posts
-        const formattedPosts = preprocessPosts(finalPosts);
-
-        // Add summary information
-        const summaryText = formatSummaryText(finalPosts.length, "feed");
+        const formattedPosts = preprocessPosts(finalPosts, { detail, includeReposts });
+        const cursorHint = nextCursor && !useHoursLimit ? ` More posts available — pass cursor="${nextCursor}" to continue.` : "";
+        const summaryText = `${formatSummaryText(finalPosts.length, "feed")}${cursorHint}`;
 
         return mcpSuccessResponse(`${summaryText}\n\n${formattedPosts}`);
       } catch (error) {
@@ -1600,39 +2270,35 @@ ${feed.purpose ? `Purpose: ${feed.purpose}` : ''}`;
     {
       list: z.string().describe("The URI of the list (e.g., at://did:plc:abcdef/app.bsky.graph.list/listname)"),
       count: z.number().min(1).max(500).describe("Number of posts to fetch or hours to look back"),
-      type: z.enum(["posts", "hours"]).describe("Whether count represents number of posts or hours to look back")
+      type: z.enum(["posts", "hours"]).describe("Whether count represents number of posts or hours to look back"),
+      detail: z.enum(["compact", "full"]).default("compact").describe("Output verbosity: 'compact' (token-efficient, default) or 'full' (XML)"),
+      includeReposts: z.boolean().default(true).describe("Whether to include reposts (default: true)"),
+      cursor: z.string().optional().describe("Optional pagination cursor returned by a previous get-list-posts call"),
     },
-    async ({ list, count, type }) => {
+    async ({ list, count, type, detail = "compact", includeReposts = true, cursor: initialCursor }) => {
       const agent = getAgent();
       if (!agent) {
         return mcpErrorResponse("Not connected to Bluesky. Check your environment variables.");
       }
 
       try {
-        // Validate the list by getting its info
         const listInfo = await validateUri(agent, list, 'list');
         if (!listInfo) {
           return mcpErrorResponse(`Invalid list URI or list not found: ${list}.`);
         }
 
-        const MAX_TOTAL_POSTS = 500; // Safety limit to prevent excessive API calls
-
+        const MAX_TOTAL_POSTS = 500;
         let allPosts: any[] = [];
-        let nextCursor: string | undefined = undefined;
+        let nextCursor: string | undefined = initialCursor;
         let shouldContinueFetching = true;
 
-        // Set up time-based or count-based fetching
         const useHoursLimit = type === "hours";
-        const targetHours = count;
-        const targetDate = new Date(Date.now() - targetHours * 60 * 60 * 1000);
+        const targetDate = new Date(Date.now() - count * 60 * 60 * 1000);
 
         while (shouldContinueFetching && allPosts.length < MAX_TOTAL_POSTS) {
-          // Calculate how many posts to fetch in this batch
-          const batchLimit = 100;
-
           const response = await agent.app.bsky.feed.getListFeed({
             list,
-            limit: batchLimit,
+            limit: 100,
             cursor: nextCursor
           });
 
@@ -1641,60 +2307,50 @@ ${feed.purpose ? `Purpose: ${feed.purpose}` : ''}`;
           }
 
           const { feed, cursor } = response.data;
+          if (!feed || feed.length === 0) {
+            nextCursor = undefined;
+            break;
+          }
 
-          // Filter posts based on time window if using hours limit
           let filteredFeed = feed;
+          if (!includeReposts) {
+            filteredFeed = filteredFeed.filter(
+              (item) => item?.reason?.$type !== 'app.bsky.feed.defs#reasonRepost'
+            );
+          }
           if (useHoursLimit) {
-            filteredFeed = feed.filter(post => {
-              const createdAt = post?.post?.record?.createdAt;
-              if (!createdAt || typeof createdAt !== 'string') return false;
-              const postDate = new Date(createdAt);
-              return postDate >= targetDate;
+            filteredFeed = filteredFeed.filter((item) => {
+              const d = getFeedItemTimestamp(item);
+              return d ? d >= targetDate : false;
             });
           }
 
-          // Add the filtered posts to our collection
           allPosts = allPosts.concat(filteredFeed);
-
-          // Update cursor for the next batch
           nextCursor = cursor;
 
-          // Check if we should continue fetching based on the mode
           if (useHoursLimit) {
-            // Check if we've reached posts older than our target date
-            const oldestPost = feed[feed.length - 1];
-            if (oldestPost?.post?.record?.createdAt && typeof oldestPost.post.record.createdAt === 'string') {
-              const postDate = new Date(oldestPost.post.record.createdAt);
-              if (postDate < targetDate) {
-                shouldContinueFetching = false;
-              }
+            const oldestDate = getFeedItemTimestamp(feed[feed.length - 1]);
+            if (oldestDate && oldestDate < targetDate) {
+              shouldContinueFetching = false;
             }
           } else {
-            // If we're using count-based fetching, stop when we have enough posts
             shouldContinueFetching = allPosts.length < count;
           }
 
-          // Stop if we don't have a cursor for the next page
           if (!cursor) {
             shouldContinueFetching = false;
           }
         }
 
-        // If we're using count-based fetching, limit the posts to the requested count
-        const finalPosts = !useHoursLimit
-          ? allPosts.slice(0, count)
-          : allPosts;
+        const finalPosts = !useHoursLimit ? allPosts.slice(0, count) : allPosts;
 
-        // If no posts were found after filtering
         if (finalPosts.length === 0) {
           return mcpSuccessResponse(`No posts found from the list.`);
         }
 
-        // Format the posts
-        const formattedPosts = preprocessPosts(finalPosts);
-
-        // Add summary information
-        const summaryText = formatSummaryText(finalPosts.length, "list");
+        const formattedPosts = preprocessPosts(finalPosts, { detail, includeReposts });
+        const cursorHint = nextCursor && !useHoursLimit ? ` More posts available — pass cursor="${nextCursor}" to continue.` : "";
+        const summaryText = `${formatSummaryText(finalPosts.length, "list")}${cursorHint}`;
 
         return mcpSuccessResponse(`${summaryText}\n\n${formattedPosts}`);
       } catch (error) {
@@ -1705,7 +2361,7 @@ ${feed.purpose ? `Purpose: ${feed.purpose}` : ''}`;
 
   registerTool(
     "get-user-posts",
-    "Fetch posts from a specific user",
+    "Fetch posts from a specific user. Supports compact (default, ~4x smaller context footprint) or full XML output, repost filtering, cursor pagination, and a 'pds' source mode that reads app.bsky.feed.post records directly from the user's PDS (bypassing AppView reply-visibility filtering, skipping reposts, and preserving URIs of deleted quoted posts while batch-hydrating live metrics).",
     {
       user: z.string().describe("The handle or DID of the user (e.g., alice.bsky.social)"),
       count: z.number().min(1).max(500).describe("Number of posts to fetch or hours to look back"),
@@ -1716,108 +2372,250 @@ ${feed.purpose ? `Purpose: ${feed.purpose}` : ''}`;
         "posts_and_author_threads",
         "posts_with_media",
         "posts_with_video"
-      ]).default("posts_with_replies").describe("Filter posts by type. Default includes replies. Options: posts_with_replies (all posts including replies), posts_no_replies (exclude replies), posts_and_author_threads (posts and self-reply threads), posts_with_media (only posts with media), posts_with_video (only posts with video)")
+      ]).default("posts_with_replies").describe("Filter posts by type (default: posts_with_replies)"),
+      detail: z.enum(["compact", "full"]).default("compact").describe("Output verbosity: 'compact' (token-efficient, default) or 'full' (XML)"),
+      includeReposts: z.boolean().default(true).describe("Whether to include reposts when source='appview' (default: true). Set false to only return posts authored by the user."),
+      source: z.enum(["appview", "pds"]).default("appview").describe("'appview' (default) uses app.bsky.feed.getAuthorFeed; 'pds' reads app.bsky.feed.post records directly from the user's PDS (bypasses AppView reply hiding, excludes reposts, and preserves deleted quote URIs)."),
+      cursor: z.string().optional().describe("Optional pagination cursor returned by a previous get-user-posts call"),
     },
-    async ({ user, count, type, filter }) => {
+    async ({ user, count, type, filter = "posts_with_replies", detail = "compact", includeReposts = true, source = "appview", cursor: initialCursor }) => {
       const agent = getAgent();
       if (!agent) {
         return mcpErrorResponse("Not connected to Bluesky. Check your environment variables.");
       }
 
       try {
-        // Verify the user exists by trying to get their profile
+        let targetDid: string;
+        let authorProfile: any;
         try {
           const profileResponse = await agent.getProfile({ actor: cleanHandle(user) });
           if (!profileResponse.success) {
             return mcpErrorResponse(`User not found: ${user}`);
           }
-
-          const MAX_TOTAL_POSTS = 500; // Safety limit to prevent excessive API calls
-
-          let allPosts: any[] = [];
-          let nextCursor: string | undefined = undefined;
-          let shouldContinueFetching = true;
-
-          // Set up time-based or count-based fetching
-          const useHoursLimit = type === "hours";
-          const targetHours = count;
-          const targetDate = new Date(Date.now() - targetHours * 60 * 60 * 1000);
-
-          while (shouldContinueFetching && allPosts.length < MAX_TOTAL_POSTS) {
-            // Calculate how many posts to fetch in this batch
-            const batchLimit = 100;
-
-            const response = await agent.app.bsky.feed.getAuthorFeed({
-              actor: profileResponse.data.did,
-              limit: batchLimit,
-              cursor: nextCursor,
-              filter: filter
-            });
-
-            if (!response.success) {
-              break;
-            }
-
-            const { feed, cursor } = response.data;
-
-            // Filter posts based on time window if using hours limit
-            let filteredFeed = feed;
-            if (useHoursLimit) {
-              filteredFeed = feed.filter(post => {
-                const createdAt = post?.post?.record?.createdAt;
-                if (!createdAt || typeof createdAt !== 'string') return false;
-                const postDate = new Date(createdAt);
-                return postDate >= targetDate;
-              });
-            }
-
-            // Add the filtered posts to our collection
-            allPosts = allPosts.concat(filteredFeed);
-
-            // Update cursor for the next batch
-            nextCursor = cursor;
-
-            // Check if we should continue fetching based on the mode
-            if (useHoursLimit) {
-              // Check if we've reached posts older than our target date
-              const oldestPost = feed[feed.length - 1];
-              if (oldestPost?.post?.record?.createdAt && typeof oldestPost.post.record.createdAt === 'string') {
-                const postDate = new Date(oldestPost.post.record.createdAt);
-                if (postDate < targetDate) {
-                  shouldContinueFetching = false;
-                }
-              }
-            } else {
-              // If we're using count-based fetching, stop when we have enough posts
-              shouldContinueFetching = allPosts.length < count;
-            }
-
-            // Stop if we don't have a cursor for the next page
-            if (!cursor) {
-              shouldContinueFetching = false;
-            }
-          }
-
-          // If we're using count-based fetching, limit the posts to the requested count
-          const finalPosts = !useHoursLimit
-            ? allPosts.slice(0, count)
-            : allPosts;
-
-          // If no posts were found after filtering
-          if (finalPosts.length === 0) {
-            return mcpSuccessResponse(`No posts found from @${user}.`);
-          }
-
-          // Format the posts
-          const formattedPosts = preprocessPosts(finalPosts);
-
-          // Add summary information
-          const summaryText = formatSummaryText(finalPosts.length, "user");
-
-          return mcpSuccessResponse(`${summaryText}\n\n${formattedPosts}`);
+          authorProfile = profileResponse.data;
+          targetDid = authorProfile.did;
         } catch (profileError) {
           return mcpErrorResponse(`Error retrieving user profile: ${profileError instanceof Error ? profileError.message : String(profileError)}`);
         }
+
+        const MAX_TOTAL_POSTS = 500;
+        const useHoursLimit = type === "hours";
+        const targetDate = new Date(Date.now() - count * 60 * 60 * 1000);
+
+        if (source === "pds") {
+          const isSelf = agent.did === targetDid;
+          let repoAgent: Agent | AtpAgent = agent;
+
+          if (!isSelf) {
+            const pdsUrl = await resolvePdsEndpoint(targetDid);
+            if (!pdsUrl) {
+              return mcpErrorResponse(`Could not resolve PDS endpoint from DID document for ${user} (${targetDid}).`);
+            }
+            repoAgent = new AtpAgent({ service: pdsUrl });
+          }
+
+          const rawRecords: Array<{ uri: string; cid: string; value: any }> = [];
+          let nextCursor: string | undefined = initialCursor;
+          let shouldContinue = true;
+
+          const recordMatchesFilter = (val: any): boolean => {
+            if (filter === "posts_no_replies") {
+              return !val?.reply;
+            }
+            if (filter === "posts_and_author_threads") {
+              if (!val?.reply) return true;
+              const parentDid = typeof val.reply?.parent?.uri === "string" ? val.reply.parent.uri.split("/")[2] : "";
+              const rootDid = typeof val.reply?.root?.uri === "string" ? val.reply.root.uri.split("/")[2] : "";
+              return parentDid === targetDid && rootDid === targetDid;
+            }
+            if (filter === "posts_with_media") {
+              const t = val?.embed?.$type || "";
+              const mt = val?.embed?.media?.$type || "";
+              return (
+                t === "app.bsky.embed.images" ||
+                t === "app.bsky.embed.video" ||
+                mt === "app.bsky.embed.images" ||
+                mt === "app.bsky.embed.video"
+              );
+            }
+            if (filter === "posts_with_video") {
+              const t = val?.embed?.$type || "";
+              const mt = val?.embed?.media?.$type || "";
+              return t === "app.bsky.embed.video" || mt === "app.bsky.embed.video";
+            }
+            return true;
+          };
+
+          while (shouldContinue && rawRecords.length < MAX_TOTAL_POSTS) {
+            const res = await repoAgent.com.atproto.repo.listRecords({
+              repo: targetDid,
+              collection: "app.bsky.feed.post",
+              limit: 100,
+              cursor: nextCursor,
+            });
+            if (!res.success || !res.data.records?.length) {
+              nextCursor = undefined;
+              break;
+            }
+
+            const batch = res.data.records;
+            for (const rec of batch) {
+              const val = rec.value as any;
+              if (useHoursLimit && val?.createdAt) {
+                const d = new Date(val.createdAt);
+                if (!Number.isNaN(d.getTime()) && d < targetDate) {
+                  continue;
+                }
+              }
+              if (recordMatchesFilter(val)) {
+                rawRecords.push({ uri: rec.uri, cid: rec.cid, value: val });
+              }
+            }
+
+            nextCursor = res.data.cursor;
+            if (useHoursLimit) {
+              const oldest = batch[batch.length - 1]?.value as any;
+              if (oldest?.createdAt) {
+                const oldestDate = new Date(oldest.createdAt);
+                if (!Number.isNaN(oldestDate.getTime()) && oldestDate < targetDate) {
+                  shouldContinue = false;
+                }
+              }
+            } else {
+              shouldContinue = rawRecords.length < count;
+            }
+            if (!nextCursor) shouldContinue = false;
+          }
+
+          const selectedRecords = !useHoursLimit ? rawRecords.slice(0, count) : rawRecords;
+          if (selectedRecords.length === 0) {
+            return mcpSuccessResponse(`No posts found from @${authorProfile.handle || user} (via PDS-direct).`);
+          }
+
+          // Batch-hydrate live PostViews via AppView getPosts in parallel chunks of 25
+          // so we get engagement counts + CDN media URLs while never losing unindexed posts or deleted-quote URIs!
+          const hydratedByUri = new Map<string, any>();
+          if (typeof agent.app?.bsky?.feed?.getPosts === "function") {
+            const CHUNK = 25;
+            const chunks: string[][] = [];
+            for (let i = 0; i < selectedRecords.length; i += CHUNK) {
+              chunks.push(selectedRecords.slice(i, i + CHUNK).map((r) => r.uri));
+            }
+            const chunkResults = await Promise.all(
+              chunks.map(async (uris) => {
+                try {
+                  const r = await agent.app.bsky.feed.getPosts({ uris });
+                  return r.success ? r.data.posts : [];
+                } catch {
+                  return [];
+                }
+              })
+            );
+            for (const posts of chunkResults) {
+              for (const p of posts) {
+                if (p?.uri) hydratedByUri.set(p.uri, p);
+              }
+            }
+          }
+
+          const feedItems = selectedRecords.map((rec) => {
+            const hydrated = hydratedByUri.get(rec.uri);
+            if (hydrated) {
+              // Ensure raw PDS record is preserved so deleted-target quote URIs in rec.value.embed survive
+              return {
+                post: { ...hydrated, record: rec.value },
+                reply: undefined,
+                reason: undefined,
+              };
+            }
+            return {
+              post: {
+                uri: rec.uri,
+                cid: rec.cid,
+                author: {
+                  did: targetDid,
+                  handle: authorProfile.handle || targetDid,
+                  displayName: authorProfile.displayName || authorProfile.handle || targetDid,
+                },
+                record: rec.value,
+                indexedAt: rec.value?.createdAt,
+              },
+              reply: undefined,
+              reason: undefined,
+            };
+          });
+
+          const formattedPosts = preprocessPosts(feedItems, { detail, includeReposts: false });
+          const cursorHint = nextCursor && !useHoursLimit ? ` More posts available — pass cursor="${nextCursor}" to continue.` : "";
+          const summaryText = `Retrieved ${feedItems.length} authored post(s) from @${authorProfile.handle || user} (via PDS-direct).${cursorHint}`;
+
+          return mcpSuccessResponse(`${summaryText}\n\n${formattedPosts}`);
+        }
+
+        // Standard AppView path via getAuthorFeed
+        let allPosts: any[] = [];
+        let nextCursor: string | undefined = initialCursor;
+        let shouldContinueFetching = true;
+
+        while (shouldContinueFetching && allPosts.length < MAX_TOTAL_POSTS) {
+          const response = await agent.app.bsky.feed.getAuthorFeed({
+            actor: targetDid,
+            limit: 100,
+            cursor: nextCursor,
+            filter: filter
+          });
+
+          if (!response.success) {
+            break;
+          }
+
+          const { feed, cursor } = response.data;
+          if (!feed || feed.length === 0) {
+            nextCursor = undefined;
+            break;
+          }
+
+          let filteredFeed = feed;
+          if (!includeReposts) {
+            filteredFeed = filteredFeed.filter(
+              (item) => item?.reason?.$type !== 'app.bsky.feed.defs#reasonRepost'
+            );
+          }
+          if (useHoursLimit) {
+            filteredFeed = filteredFeed.filter((item) => {
+              const d = getFeedItemTimestamp(item);
+              return d ? d >= targetDate : false;
+            });
+          }
+
+          allPosts = allPosts.concat(filteredFeed);
+          nextCursor = cursor;
+
+          if (useHoursLimit) {
+            const oldestDate = getFeedItemTimestamp(feed[feed.length - 1]);
+            if (oldestDate && oldestDate < targetDate) {
+              shouldContinueFetching = false;
+            }
+          } else {
+            shouldContinueFetching = allPosts.length < count;
+          }
+
+          if (!cursor) {
+            shouldContinueFetching = false;
+          }
+        }
+
+        const finalPosts = !useHoursLimit ? allPosts.slice(0, count) : allPosts;
+
+        if (finalPosts.length === 0) {
+          return mcpSuccessResponse(`No posts found from @${user}.`);
+        }
+
+        const formattedPosts = preprocessPosts(finalPosts, { detail, includeReposts });
+        const cursorHint = nextCursor && !useHoursLimit ? ` More posts available — pass cursor="${nextCursor}" to continue.` : "";
+        const summaryText = `${formatSummaryText(finalPosts.length, "user")}${cursorHint}`;
+
+        return mcpSuccessResponse(`${summaryText}\n\n${formattedPosts}`);
       } catch (error) {
         return mcpErrorResponse(`Error fetching user posts: ${error instanceof Error ? error.message : String(error)}`);
       }
@@ -1970,49 +2768,42 @@ ${p?.indexedAt ? `Indexed at: ${new Date(p.indexedAt).toLocaleString()}` : ''}
 
   registerTool(
     "get-followers",
-    "Get a list of users that follow a person",
+    "Get one page of users that follow a person, with compact (default) or full detail and cursor pagination.",
     {
       user: z.string().describe("The handle or DID of the user (e.g., alice.bsky.social)"),
-      limit: z.number().min(1).max(500).default(500).describe("Maximum number of followers to fetch (1-500)"),
+      limit: z.number().min(1).max(500).default(100).describe("Maximum number of followers to fetch (1-500, default 100)"),
+      cursor: z.string().optional().describe("Pagination cursor returned by a previous get-followers call"),
+      detail: z.enum(["compact", "full"]).default("compact").describe("Output verbosity: 'compact' (~80 bytes/user, default) or 'full' (includes bio & counts)"),
     },
-    async ({ user, limit }) => {
+    async ({ user, limit = 100, cursor: initialCursor, detail = "compact" }) => {
       const agent = getAgent();
       if (!agent) {
         return mcpErrorResponse("Not connected to Bluesky. Check your environment variables.");
       }
 
       try {
-        // First, verify the user exists by trying to get their profile
         try {
           const profileResponse = await agent.getProfile({ actor: cleanHandle(user) });
           if (!profileResponse.success) {
             return mcpErrorResponse(`User not found: ${user}`);
           }
 
-          // Use the display name in the summary if available
-          const displayName = profileResponse.data.displayName || user;
-
-          // Now fetch who follows this user with pagination
-          const MAX_BATCH_SIZE = 100; // Maximum number of followers per API call
-          const MAX_BATCHES = 5;      // Maximum number of API calls to make (100 x 5 = 500)
+          const MAX_BATCH_SIZE = 100;
+          const MAX_BATCHES = 5;
           let allFollowers: any[] = [];
-          let nextCursor: string | undefined = undefined;
+          let nextCursor: string | undefined = initialCursor;
           let batchCount = 0;
 
-          // Loop to fetch followers with pagination
           while (batchCount < MAX_BATCHES && allFollowers.length < limit) {
-            // Calculate how many followers to fetch in this batch
             const batchLimit = Math.min(MAX_BATCH_SIZE, limit - allFollowers.length);
 
-            // Make the API call with cursor if we have one
             const response = await agent.app.bsky.graph.getFollowers({
-              actor: cleanHandle(user),
+              actor: profileResponse.data.did,
               limit: batchLimit,
               cursor: nextCursor
             });
 
             if (!response.success) {
-              // If we've already fetched some followers, return those
               if (allFollowers.length > 0) {
                 break;
               }
@@ -2020,15 +2811,10 @@ ${p?.indexedAt ? `Indexed at: ${new Date(p.indexedAt).toLocaleString()}` : ''}
             }
 
             const { followers, cursor } = response.data;
-
-            // Add the fetched followers to our collection
             allFollowers = allFollowers.concat(followers);
-
-            // Update cursor for the next batch
             nextCursor = cursor;
             batchCount++;
 
-            // If no cursor returned or we've reached our limit, stop paginating
             if (!cursor || allFollowers.length >= limit) {
               break;
             }
@@ -2038,8 +2824,11 @@ ${p?.indexedAt ? `Indexed at: ${new Date(p.indexedAt).toLocaleString()}` : ''}
             return mcpSuccessResponse(`@${user} doesn't have any followers.`);
           }
 
-          // Format the followers list
           const formattedFollowers = allFollowers.map((follower: any, index: number) => {
+            if (detail === "compact") {
+              const name = follower.displayName ? ` (${follower.displayName})` : '';
+              return `${index + 1}. @${follower.handle}${name} — ${follower.did}`;
+            }
             return `User #${index + 1}:
 Display Name: ${follower.displayName || 'No display name'}
 Handle: @${follower.handle}
@@ -2048,12 +2837,11 @@ ${follower.description ? `Bio: ${follower.description}` : 'Bio: No bio provided'
 ${follower.followersCount !== undefined ? `Followers: ${follower.followersCount}` : ''}
 ${follower.followsCount !== undefined ? `Following: ${follower.followsCount}` : ''}
 ${follower.postsCount !== undefined ? `Posts: ${follower.postsCount}` : ''}
-${follower.indexedAt ? `Following since: ${new Date(follower.indexedAt).toLocaleString()}` : ''}
+${follower.indexedAt ? `Following since: ${formatIsoTimestamp(follower.indexedAt)}` : ''}
 ---`;
-          }).join("\n\n");
+          }).join(detail === "compact" ? "\n" : "\n\n");
 
-          // Create a summary
-          const summaryText = `Retrieved ${allFollowers.length} followers of @${user}.${nextCursor ? ' More results are available.' : ''}`;
+          const summaryText = `Retrieved ${allFollowers.length} followers of @${user}.${nextCursor ? ` More pages available — pass cursor="${nextCursor}" to continue.` : ''}`;
 
           return mcpSuccessResponse(`${summaryText}\n\n${formattedFollowers}`);
 
@@ -2068,50 +2856,49 @@ ${follower.indexedAt ? `Following since: ${new Date(follower.indexedAt).toLocale
 
   registerTool(
     "get-post-likes",
-    "Get information about users who have liked a specific post",
+    "Get users who liked a specific post (accepts AT URI or https://bsky.app/... web URL)",
     {
-      uri: z.string().describe("The URI of the post to get likes for (e.g., at://did:plc:abcdef/app.bsky.feed.post/123)"),
+      uri: z.string().describe("AT URI or Bluesky web URL of the post"),
       limit: z.number().min(1).max(100).default(100).describe("Maximum number of likes to fetch (1-100)"),
+      cursor: z.string().optional().describe("Optional pagination cursor returned by a previous get-post-likes call"),
+      detail: z.enum(["compact", "full"]).default("compact").describe("Output verbosity: 'compact' (1 line/user, default) or 'full'"),
     },
-    async ({ uri, limit }) => {
+    async ({ uri, limit = 100, cursor, detail = "compact" }) => {
       const agent = getAgent();
       if (!agent) {
         return mcpErrorResponse("Not connected to Bluesky. Check your environment variables.");
       }
 
       try {
-        // First, we need to get the post's CID
-        const response = await agent.app.bsky.feed.getPostThread({ uri });
-
-        if (!response.success || response.data.thread.$type !== 'app.bsky.feed.defs#threadViewPost') {
-          return mcpErrorResponse("Failed to get post information.");
+        const target = await resolvePostTarget(agent, uri);
+        if ('error' in target) {
+          return mcpErrorResponse(target.error);
         }
 
-        // Get the post's CID
-        const threadPost = response.data.thread as any;
-        const post = threadPost.post;
-        const cid = post.cid;
-
-        // Now fetch the likes
         const likesResponse = await agent.app.bsky.feed.getLikes({
-          uri,
-          cid,
-          limit
+          uri: target.uri,
+          cid: target.cid,
+          limit,
+          cursor,
         });
 
         if (!likesResponse.success) {
           return mcpErrorResponse("Failed to fetch likes for the post.");
         }
 
-        const { likes } = likesResponse.data;
+        const { likes, cursor: nextCursor } = likesResponse.data;
 
         if (!likes || likes.length === 0) {
           return mcpSuccessResponse("No likes found for this post.");
         }
 
-        // Format the likes list
         const formattedLikes = likes.map((like: any, index: number) => {
           const actor = like.actor;
+          if (detail === "compact") {
+            const name = actor.displayName ? ` (${actor.displayName})` : '';
+            const ts = like.indexedAt ? ` [${formatIsoTimestamp(like.indexedAt)}]` : '';
+            return `${index + 1}. @${actor.handle}${name} — ${actor.did}${ts}`;
+          }
           return `User #${index + 1}:
 Display Name: ${actor.displayName || 'No display name'}
 Handle: @${actor.handle}
@@ -2120,12 +2907,11 @@ ${actor.description ? `Bio: ${actor.description.substring(0, 100)}${actor.descri
 ${actor.followersCount !== undefined ? `Followers: ${actor.followersCount}` : ''}
 ${actor.followsCount !== undefined ? `Following: ${actor.followsCount}` : ''}
 ${actor.postsCount !== undefined ? `Posts: ${actor.postsCount}` : ''}
-${like.indexedAt ? `Liked at: ${new Date(like.indexedAt).toLocaleString()}` : ''}
+${like.indexedAt ? `Liked at: ${formatIsoTimestamp(like.indexedAt)}` : ''}
 ---`;
-        }).join("\n\n");
+        }).join(detail === "compact" ? "\n" : "\n\n");
 
-        // Create a summary
-        const summaryText = `Retrieved ${likes.length} likes for the post.${likesResponse.data.cursor ? ' More likes are available.' : ''}`;
+        const summaryText = `Retrieved ${likes.length} likes for ${target.uri}.${nextCursor ? ` More likes available — pass cursor="${nextCursor}" to continue.` : ''}`;
 
         return mcpSuccessResponse(`${summaryText}\n\n${formattedLikes}`);
 

@@ -10,16 +10,22 @@ const EXPECTED_TOOLS = [
   "get-timeline-posts",
   "get-notifications",
   "create-post",
+  "create-thread",
   "delete-post",
   "get-profile",
   "search-posts",
+  "get-posts",
   "get-post-thread",
+  "get-post-quotes",
   "convert-url-to-uri",
   "search-people",
   "search-feeds",
   "get-liked-posts",
   "get-trends",
   "like-post",
+  "unlike-post",
+  "repost",
+  "unrepost",
   "follow-user",
   "unfollow-user",
   "get-pinned-feeds",
@@ -54,7 +60,7 @@ async function testExpectedToolSet() {
     const { tools } = await client.listTools();
     const names = tools.map(t => t.name).sort();
     assert.deepEqual(names, [...EXPECTED_TOOLS].sort(),
-      `registered tool set drifted from the 30 expected names`);
+      `registered tool set drifted from the ${EXPECTED_TOOLS.length} expected names`);
   } finally {
     await close();
   }
@@ -541,8 +547,8 @@ async function testDmToolsFlow() {
 }
 
 async function main() {
-  const cases: Array<[string, () => Promise<void>]> = [
-    ["registers exactly the expected 30 tools", testExpectedToolSet],
+    const cases: Array<[string, () => Promise<void>]> = [
+    [`registers exactly the expected ${EXPECTED_TOOLS.length} tools`, testExpectedToolSet],
     ["tools include MCP 2026-07-28 annotations (readOnly, destructive, idempotent hints)", testToolAnnotations],
     ["tools error out when getAgent returns null", testNullAgentReturnsError],
     ["getAgent is resolved per tool call, not cached", testAgentIsResolvedPerCall],

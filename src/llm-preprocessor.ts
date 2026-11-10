@@ -1,752 +1,941 @@
-// Implements the spec described in /POST_FORMAT_SPEC.md
-import { formatISO9075 } from 'date-fns';
-import type { 
+// Implements the spec described in /POST_FORMAT_SPEC.md (plus compact mode)
+import type {
   AppBskyFeedDefs,
   AppBskyEmbedImages,
   AppBskyEmbedVideo,
   AppBskyEmbedExternal,
   AppBskyEmbedRecord,
-  AppBskyActorDefs,
-  AppBskyFeedPost
+  AppBskyFeedPost,
 } from '@atproto/api';
-import { RichText } from '@atproto/api';
-import { escapeXml } from './utils.js';
+import { escapeXml, facetsToMarkdown, formatIsoTimestamp } from './utils.js';
 
-/**
- * Convert Bluesky post text + facets into Markdown
- * @param text The post text content
- * @param facets Optional array of facets from the post
- * @returns Markdown formatted text with proper links and mentions
- */
-export function facetsToMarkdown(text: string, facets?: any[]): string {
-  if (!text) return '';
-  
-  // Initialize RichText with the text and facets
-  const rt = new RichText({ text, facets: facets ?? [] });
-  
-  // Transform segments into Markdown
-  let markdown = '';
-  for (const segment of rt.segments()) {
-    if (segment.isLink()) {
-      //markdown += `[${segment.text}](${segment.link?.uri})`;
-      markdown += `<${segment.link?.uri}>`; // use the markdown auto-link syntax for simplicity for the LLM instead of linking the text fragment
-    } else if (segment.isMention()) {
-      markdown += `[${segment.text}](https://bsky.app/profile/${segment.mention?.did})`;
-    } else if (segment.isTag()) {
-      markdown += `#${segment.tag?.tag}`;
-    } else {
-      markdown += segment.text;
+export { facetsToMarkdown };
+
+export interface PreprocessOptions {
+  detail?: 'compact' | 'full';
+  includeReposts?: boolean;
+}
+
+export interface ThreadFormatOptions {
+  detail?: 'compact' | 'full';
+  maxRepliesPerNode?: number;
+}
+
+interface NormalizedQuote {
+  status: 'ok' | 'not_found' | 'blocked' | 'detached' | 'unhydrated';
+  uri: string;
+  bskyUrl?: string;
+  authorHandle?: string;
+  authorName?: string;
+  postedAt?: string;
+  text?: string;
+  facets?: any[];
+  likeCount?: number;
+  repostCount?: number;
+  replyCount?: number;
+  quoteCount?: number;
+  mediaSummary?: NormalizedMedia[];
+}
+
+type NormalizedMedia =
+  | {
+      kind: 'image';
+      alt: string;
+      url: string;
     }
-  }
-  
-  return markdown;
-}
+  | {
+      kind: 'link';
+      title: string;
+      url: string;
+      description: string;
+      thumb?: string;
+    }
+  | {
+      kind: 'video';
+      alt?: string;
+      playlist?: string;
+      thumbnail?: string;
+      url?: string;
+    };
 
 /**
- * Formats a date to a human-readable format
- */
-function formatDate(dateString: string): string {
-  try {
-    const date = new Date(dateString);
-    return formatISO9075(date).replace('T', ', ');
-  } catch (e) {
-    return dateString;
-  }
-}
-
-/**
- * Creates a Bluesky URL from a URI
+ * Creates a Bluesky web URL from an AT post URI and optional handle.
  */
 function createBskyUrl(uri: string, handle?: string): string {
   try {
+    if (!uri) return '';
     const parts = uri.split('/');
     const did = parts[2];
     const rkey = parts[parts.length - 1];
+    if (!did || !rkey) return '';
     return `https://bsky.app/profile/${handle || did}/post/${rkey}`;
-  } catch (e) {
+  } catch {
     return '';
   }
 }
 
 /**
- * Determines the post type based on its properties
+ * Extract media items from an embed view (or raw embed record fallback).
  */
-function determinePostType(post: AppBskyFeedDefs.PostView, reason?: AppBskyFeedDefs.ReasonRepost): string[] {
-  const types: string[] = [];
-  
-  // Base type
-  const record = post.record as AppBskyFeedPost.Record;
-  if (record.reply) {
-    types.push('reply');
-  } else {
-    types.push('standalone');
+function extractMediaOnly(embed: any, authorDid?: string): NormalizedMedia[] {
+  if (!embed || typeof embed !== 'object') return [];
+  const type = typeof embed.$type === 'string' ? embed.$type : '';
+  const items: NormalizedMedia[] = [];
+
+  // Hydrated Views
+  if (type === 'app.bsky.embed.images#view' && Array.isArray(embed.images)) {
+    for (const img of embed.images as AppBskyEmbedImages.ViewImage[]) {
+      if (!img) continue;
+      items.push({
+        kind: 'image',
+        alt: img.alt || '',
+        url: img.fullsize || img.thumb || '',
+      });
+    }
+  } else if (type === 'app.bsky.embed.external#view' && embed.external) {
+    const ext = (embed as AppBskyEmbedExternal.View).external;
+    items.push({
+      kind: 'link',
+      title: ext.title || '',
+      url: ext.uri || '',
+      description: ext.description || '',
+      thumb: ext.thumb || undefined,
+    });
+  } else if (type === 'app.bsky.embed.video#view' || type.includes('embed.video#view')) {
+    const vid = embed.video || (embed as AppBskyEmbedVideo.View);
+    items.push({
+      kind: 'video',
+      alt: vid.alt || embed.alt || undefined,
+      thumbnail: vid.thumbnail || vid.thumb || embed.thumbnail || undefined,
+      playlist: vid.playlist || embed.playlist || undefined,
+      url: vid.url || undefined,
+    });
   }
-  
-  // Note: repost is no longer a post type since we're using a dedicated repost structure
-  
-  // Check if it has a quoted post
-  if (post.embed && post.embed.$type === 'app.bsky.embed.record#view') {
+  // Raw Record Fallbacks (e.g. unhydrated PDS records)
+  else if (type === 'app.bsky.embed.images' && Array.isArray(embed.images)) {
+    for (const img of embed.images) {
+      if (!img) continue;
+      const cid = img.image?.ref?.$link || img.image?.cid || '';
+      const fallbackUrl =
+        authorDid && cid
+          ? `https://cdn.bsky.app/img/feed_fullsize/plain/${authorDid}/${cid}@jpeg`
+          : cid
+            ? `blob:${cid}`
+            : '';
+      items.push({
+        kind: 'image',
+        alt: img.alt || '',
+        url: fallbackUrl,
+      });
+    }
+  } else if (type === 'app.bsky.embed.external' && embed.external) {
+    items.push({
+      kind: 'link',
+      title: embed.external.title || '',
+      url: embed.external.uri || '',
+      description: embed.external.description || '',
+    });
+  } else if (type === 'app.bsky.embed.video') {
+    const cid = embed.video?.ref?.$link || embed.video?.cid || '';
+    items.push({
+      kind: 'video',
+      alt: embed.alt || undefined,
+      playlist:
+        authorDid && cid
+          ? `https://video.bsky.app/watch/${encodeURIComponent(authorDid)}/${cid}/playlist.m3u8`
+          : undefined,
+    });
+  }
+
+  return items;
+}
+
+/**
+ * Normalize an embedded record view (or raw record pointer) into a NormalizedQuote.
+ */
+function normalizeEmbeddedRecord(recordContainer: any, rawRecordFallback?: any): NormalizedQuote | null {
+  const rec = recordContainer?.record ?? recordContainer;
+  const fallbackUri: string =
+    rawRecordFallback?.record?.uri ||
+    rawRecordFallback?.uri ||
+    rec?.uri ||
+    '';
+
+  if (!rec || typeof rec !== 'object') {
+    if (fallbackUri) {
+      return { status: 'unhydrated', uri: fallbackUri, bskyUrl: createBskyUrl(fallbackUri) };
+    }
+    return null;
+  }
+
+  const rType = typeof rec.$type === 'string' ? rec.$type : '';
+
+  if (rType === 'app.bsky.embed.record#viewRecord' || (rec.uri && rec.author && rec.value)) {
+    const viewRec = rec as AppBskyEmbedRecord.ViewRecord;
+    const val = (viewRec.value || {}) as { text?: string; createdAt?: string; facets?: any[] };
+    const nestedMedia: NormalizedMedia[] = [];
+    if (Array.isArray(viewRec.embeds)) {
+      for (const e of viewRec.embeds) {
+        if ((e as any)?.$type === 'app.bsky.embed.recordWithMedia#view') {
+          nestedMedia.push(...extractMediaOnly((e as any).media, viewRec.author?.did));
+        } else {
+          nestedMedia.push(...extractMediaOnly(e, viewRec.author?.did));
+        }
+      }
+    }
+    return {
+      status: 'ok',
+      uri: viewRec.uri,
+      bskyUrl: createBskyUrl(viewRec.uri, viewRec.author?.handle),
+      authorHandle: viewRec.author?.handle || '',
+      authorName: viewRec.author?.displayName || viewRec.author?.handle || '',
+      postedAt: formatIsoTimestamp(val.createdAt || viewRec.indexedAt),
+      text: val.text || '',
+      facets: val.facets,
+      likeCount: viewRec.likeCount ?? 0,
+      repostCount: viewRec.repostCount ?? 0,
+      replyCount: viewRec.replyCount ?? 0,
+      quoteCount: viewRec.quoteCount ?? 0,
+      mediaSummary: nestedMedia.length > 0 ? nestedMedia : undefined,
+    };
+  }
+
+  if (rType === 'app.bsky.embed.record#viewNotFound' || rec.notFound) {
+    const uri = rec.uri || fallbackUri;
+    return uri ? { status: 'not_found', uri, bskyUrl: createBskyUrl(uri) } : null;
+  }
+
+  if (rType === 'app.bsky.embed.record#viewBlocked' || rec.blocked) {
+    const uri = rec.uri || fallbackUri;
+    return uri ? { status: 'blocked', uri, bskyUrl: createBskyUrl(uri) } : null;
+  }
+
+  if (rType === 'app.bsky.embed.record#viewDetached' || rec.detached) {
+    const uri = rec.uri || fallbackUri;
+    return uri ? { status: 'detached', uri, bskyUrl: createBskyUrl(uri) } : null;
+  }
+
+  // Raw ATProto record pointer: { uri, cid }
+  if (typeof rec.uri === 'string' && rec.uri.startsWith('at://')) {
+    return {
+      status: 'unhydrated',
+      uri: rec.uri,
+      bskyUrl: createBskyUrl(rec.uri),
+    };
+  }
+
+  if (fallbackUri) {
+    return { status: 'unhydrated', uri: fallbackUri, bskyUrl: createBskyUrl(fallbackUri) };
+  }
+
+  return null;
+}
+
+/**
+ * Extract both quoted post (if any) and media attachments (if any) from a PostView,
+ * handling `record#view`, `recordWithMedia#view`, and raw PDS `record.embed` structures.
+ */
+function extractQuoteAndMedia(post: any): { quote: NormalizedQuote | null; media: NormalizedMedia[] } {
+  const viewEmbed = post?.embed;
+  const rawEmbed = post?.record?.embed;
+  const authorDid: string | undefined = post?.author?.did || (typeof post?.uri === 'string' ? post.uri.split('/')[2] : undefined);
+
+  let quote: NormalizedQuote | null = null;
+  let media: NormalizedMedia[] = [];
+
+  if (viewEmbed && typeof viewEmbed === 'object') {
+    const vType = typeof viewEmbed.$type === 'string' ? viewEmbed.$type : '';
+
+    if (vType === 'app.bsky.embed.recordWithMedia#view') {
+      const rawRecFallback = rawEmbed?.$type === 'app.bsky.embed.recordWithMedia' ? rawEmbed.record : rawEmbed;
+      quote = normalizeEmbeddedRecord(viewEmbed.record, rawRecFallback);
+      media = extractMediaOnly(viewEmbed.media, authorDid);
+    } else if (vType === 'app.bsky.embed.record#view') {
+      quote = normalizeEmbeddedRecord(viewEmbed, rawEmbed);
+    } else {
+      media = extractMediaOnly(viewEmbed, authorDid);
+    }
+  }
+
+  // Fallback to raw record.embed if viewEmbed was absent or missing pieces
+  if (rawEmbed && typeof rawEmbed === 'object') {
+    const rType = typeof rawEmbed.$type === 'string' ? rawEmbed.$type : '';
+    if (!quote) {
+      if (rType === 'app.bsky.embed.recordWithMedia' && rawEmbed.record) {
+        quote = normalizeEmbeddedRecord(rawEmbed.record, rawEmbed.record);
+      } else if (rType === 'app.bsky.embed.record' && rawEmbed.record) {
+        quote = normalizeEmbeddedRecord(rawEmbed.record, rawEmbed);
+      }
+    }
+    if (media.length === 0) {
+      if (rType === 'app.bsky.embed.recordWithMedia' && rawEmbed.media) {
+        media = extractMediaOnly(rawEmbed.media, authorDid);
+      } else if (rType !== 'app.bsky.embed.record') {
+        media = extractMediaOnly(rawEmbed, authorDid);
+      }
+    }
+  }
+
+  return { quote, media };
+}
+
+/**
+ * Render NormalizedMedia items as XML `<embed>` elements.
+ */
+function renderMediaXml(media: NormalizedMedia[], indent: string): string {
+  let out = '';
+  for (const m of media) {
+    if (m.kind === 'image') {
+      out += `${indent}<embed type="image">\n`;
+      out += `${indent}  Image description: "${escapeXml(m.alt || 'No description provided')}"\n`;
+      if (m.url) {
+        out += `${indent}  URL: ${escapeXml(m.url)}\n`;
+      }
+      out += `${indent}</embed>\n`;
+    } else if (m.kind === 'link') {
+      out += `${indent}<embed type="link">\n`;
+      if (m.title) out += `${indent}  Title: "${escapeXml(m.title)}"\n`;
+      if (m.url) out += `${indent}  URL: ${escapeXml(m.url)}\n`;
+      if (m.description) out += `${indent}  Description: "${escapeXml(m.description)}"\n`;
+      if (m.thumb) out += `${indent}  Thumbnail: ${escapeXml(m.thumb)}\n`;
+      out += `${indent}</embed>\n`;
+    } else if (m.kind === 'video') {
+      out += `${indent}<embed type="video">\n`;
+      if (m.alt) out += `${indent}  Video description: "${escapeXml(m.alt)}"\n`;
+      if (m.thumbnail) out += `${indent}  Thumbnail: ${escapeXml(m.thumbnail)}\n`;
+      if (m.playlist) out += `${indent}  Playlist: ${escapeXml(m.playlist)}\n`;
+      if (m.url) out += `${indent}  URL: ${escapeXml(m.url)}\n`;
+      out += `${indent}</embed>\n`;
+    }
+  }
+  return out;
+}
+
+/**
+ * Render NormalizedQuote as an XML `<quoted_post>` element.
+ */
+function renderQuoteXml(quote: NormalizedQuote, indent: string): string {
+  if (quote.status !== 'ok') {
+    const bskyAttr = quote.bskyUrl ? ` bsky_url="${escapeXml(quote.bskyUrl)}"` : '';
+    return `${indent}<quoted_post uri="${escapeXml(quote.uri)}"${bskyAttr} status="${escapeXml(quote.status)}" />\n`;
+  }
+
+  let out = `${indent}<quoted_post uri="${escapeXml(quote.uri)}" bsky_url="${escapeXml(quote.bskyUrl || '')}" author_name="${escapeXml(quote.authorName || '')}" author_handle="${escapeXml(quote.authorHandle || '')}" posted_at="${escapeXml(quote.postedAt || '')}">\n`;
+  out += `${indent}  <content>\n${indent}    ${facetsToMarkdown(quote.text || '', quote.facets, { xmlSafe: true })}\n${indent}  </content>\n`;
+  if (quote.mediaSummary && quote.mediaSummary.length > 0) {
+    out += renderMediaXml(quote.mediaSummary, `${indent}  `);
+  }
+  out += `${indent}  Engagement: ${quote.likeCount ?? 0} likes, ${quote.repostCount ?? 0} reposts, ${quote.replyCount ?? 0} replies${quote.quoteCount ? `, ${quote.quoteCount} quotes` : ''}\n`;
+  out += `${indent}</quoted_post>\n`;
+  return out;
+}
+
+/**
+ * Render NormalizedMedia items in compact text lines.
+ */
+function renderMediaCompact(media: NormalizedMedia[], indent: string): string[] {
+  const lines: string[] = [];
+  for (const m of media) {
+    if (m.kind === 'image') {
+      const cleanAlt = m.alt ? m.alt.replace(/\s+/g, ' ').trim() : '';
+      const shortAlt = cleanAlt.length > 240 ? `${cleanAlt.slice(0, 240)}…` : cleanAlt;
+      const altPart = shortAlt ? ` (alt: "${shortAlt}")` : '';
+      lines.push(`${indent}media: [image] ${m.url}${altPart}`);
+    } else if (m.kind === 'link') {
+      const titlePart = m.title ? ` "${m.title.replace(/\s+/g, ' ').trim()}"` : '';
+      lines.push(`${indent}media: [link]${titlePart} ${m.url}`);
+    } else if (m.kind === 'video') {
+      const cleanAlt = m.alt ? m.alt.replace(/\s+/g, ' ').trim() : '';
+      const shortAlt = cleanAlt.length > 240 ? `${cleanAlt.slice(0, 240)}…` : cleanAlt;
+      const altPart = shortAlt ? ` (alt: "${shortAlt}")` : '';
+      lines.push(`${indent}media: [video] ${m.playlist || m.url || m.thumbnail || ''}${altPart}`);
+    }
+  }
+  return lines;
+}
+
+/**
+ * Render NormalizedQuote in compact text lines.
+ */
+function renderQuoteCompact(quote: NormalizedQuote, indent: string): string[] {
+  if (quote.status !== 'ok') {
+    return [`${indent}quote: [${quote.status}] ${quote.uri}`];
+  }
+  const cleanText = facetsToMarkdown(quote.text || '', quote.facets).replace(/\n+/g, ' ⏎ ').trim();
+  const lines = [
+    `${indent}quote: @${quote.authorHandle} (${quote.uri}, ${quote.postedAt || 'unknown'}) — "${cleanText}"`,
+  ];
+  if (quote.mediaSummary && quote.mediaSummary.length > 0) {
+    lines.push(...renderMediaCompact(quote.mediaSummary, `${indent}  `));
+  }
+  return lines;
+}
+
+/**
+ * Extract reply parent & root URIs from either record.reply or feedItem.reply.
+ */
+function extractReplyRefs(post: any, replyView?: any): { parentUri?: string; rootUri?: string } {
+  const record = post?.record as AppBskyFeedPost.Record | undefined;
+  const parentUri: string | undefined =
+    record?.reply?.parent?.uri ||
+    (replyView?.parent && typeof replyView.parent === 'object' && 'uri' in replyView.parent
+      ? (replyView.parent as any).uri
+      : undefined);
+  const rootUri: string | undefined =
+    record?.reply?.root?.uri ||
+    (replyView?.root && typeof replyView.root === 'object' && 'uri' in replyView.root
+      ? (replyView.root as any).uri
+      : undefined);
+  return { parentUri, rootUri };
+}
+
+/**
+ * Format a single PostView as XML at a given indentation level, with optional pre-rendered `<replies>` children.
+ */
+function renderPostXml(
+  post: any,
+  options: {
+    indentLevel: number;
+    replyView?: any;
+    isRequestedPost?: boolean;
+    childrenXml?: string;
+  }
+): string {
+  if (!post || !post.uri) return '';
+  const indent = '  '.repeat(options.indentLevel);
+  const record = (post.record || {}) as AppBskyFeedPost.Record;
+  const { parentUri, rootUri } = extractReplyRefs(post, options.replyView);
+  const { quote, media } = extractQuoteAndMedia(post);
+
+  const types: string[] = [record.reply || parentUri ? 'reply' : 'standalone'];
+  if (quote) {
     types.push('quote');
   }
-  
-  // We're no longer tracking reply limitations
-  
-  return types;
+
+  const handle = post.author?.handle || '';
+  const displayName = post.author?.displayName || handle;
+  const bskyUrl = createBskyUrl(post.uri, handle);
+  const createdIso = formatIsoTimestamp(record.createdAt || post.indexedAt);
+  const indexedIso = formatIsoTimestamp(post.indexedAt);
+
+  let attrs = `type="${escapeXml(types.join(','))}" uri="${escapeXml(post.uri)}" bsky_url="${escapeXml(bskyUrl)}" author_name="${escapeXml(displayName)}" author_handle="${escapeXml(handle)}" posted_at="${escapeXml(createdIso)}"`;
+
+  // Surface server indexed_at when client clock skew exceeds 60 seconds
+  if (record.createdAt && post.indexedAt) {
+    const diffMs = Math.abs(new Date(post.indexedAt).getTime() - new Date(record.createdAt).getTime());
+    if (!Number.isNaN(diffMs) && diffMs > 60_000) {
+      attrs += ` indexed_at="${escapeXml(indexedIso)}"`;
+    }
+  }
+
+  if (parentUri) {
+    attrs += ` reply_to="${escapeXml(parentUri)}"`;
+  }
+  if (rootUri && rootUri !== parentUri) {
+    attrs += ` root_uri="${escapeXml(rootUri)}"`;
+  }
+  if (options.isRequestedPost) {
+    attrs += ` requested="true"`;
+  }
+
+  let out = `${indent}<post ${attrs}>\n`;
+  out += `${indent}  <content>\n${indent}    ${facetsToMarkdown(record.text || '', record.facets, { xmlSafe: true })}\n${indent}  </content>\n`;
+
+  if (quote) {
+    out += renderQuoteXml(quote, `${indent}  `);
+  }
+  if (media.length > 0) {
+    out += renderMediaXml(media, `${indent}  `);
+  }
+
+  const likes = post.likeCount ?? 0;
+  const reposts = post.repostCount ?? 0;
+  const replies = post.replyCount ?? 0;
+  const quotes = post.quoteCount ?? 0;
+  if (post.likeCount !== undefined || post.repostCount !== undefined || post.replyCount !== undefined) {
+    out += `${indent}  Engagement: ${likes} likes, ${reposts} reposts, ${replies} replies${quotes ? `, ${quotes} quotes` : ''}\n`;
+  }
+
+  if (options.childrenXml) {
+    out += `${indent}  <replies>\n${options.childrenXml}${indent}  </replies>\n`;
+  }
+
+  out += `${indent}</post>\n`;
+  return out;
 }
 
 /**
- * Format a single post according to the spec
+ * Format a single PostView in compact text format at a given indentation depth.
  */
-function formatPost(feedItem: AppBskyFeedDefs.FeedViewPost): string {
-  const { post, reply, reason } = feedItem;
-  
-  // Handle repost specially
-  if (reason && reason.$type === 'app.bsky.feed.defs#reasonRepost') {
-    // Create a repost element with the reposter's info
-    const reasonRepost = reason as AppBskyFeedDefs.ReasonRepost;
-    const formattedDate = formatDate(reasonRepost.indexedAt || '');
-    let result = `  <repost author_name="${reasonRepost.by.displayName || ''}" author_handle="${reasonRepost.by.handle}" reposted_at="${formattedDate}">\n`;
-    
-    // Format the original post (without the repost type)
-    const types = determinePostType(post);
-    const bskyUrl = createBskyUrl(post.uri, post.author.handle);
-    const record = post.record as AppBskyFeedPost.Record;
-    const postDate = formatDate(record.createdAt);
-    
-    // Add the post inside the repost
-    result += `    <post type="${types.join(',')}" uri="${post.uri}" bsky_url="${bskyUrl}" author_name="${post.author.displayName || ''}" author_handle="${post.author.handle}" posted_at="${postDate}">\n`;
-    result += `      <content>\n        ${facetsToMarkdown(record.text, record.facets)}\n      </content>\n`;
-    
-    // Add embeds
-    result += formatEmbeds(post, '      ');
-    
-    // Add engagement metrics info (without Posted: prefix)
-    result += `      \n      Engagement: ${post.likeCount} likes, ${post.repostCount} reposts, ${post.replyCount} replies${post.quoteCount ? ', ' + post.quoteCount + ' quotes' : ''}\n`;
-    
-    // Close the post and repost tags
-    result += `    </post>\n`;
-    result += `  </repost>`;
-    
-    return result;
+function renderPostCompact(
+  post: any,
+  options: {
+    depth: number;
+    replyView?: any;
+    isRequestedPost?: boolean;
+    repostBy?: { handle: string; displayName?: string; indexedAt?: string };
+    childrenCompact?: string;
   }
-  
-  // For non-reposts, continue with normal formatting
-  const types = determinePostType(post, reason as AppBskyFeedDefs.ReasonRepost);
-  const bskyUrl = createBskyUrl(post.uri, post.author.handle);
-  const record = post.record as AppBskyFeedPost.Record;
-  const postDate = formatDate(record.createdAt);
-  
-  // Start building the post tag with all the attributes
-  let postAttrs = `type="${types.join(',')}" uri="${post.uri}" bsky_url="${bskyUrl}" author_name="${post.author.displayName || ''}" author_handle="${post.author.handle}" posted_at="${postDate}"`;
-  
-  // Add reply_to attribute if this is a reply
-  if (reply && types.includes('reply') && reply.parent.$type === 'app.bsky.feed.defs#postView') {
-    const parentUri = (reply.parent as AppBskyFeedDefs.PostView).uri;
-    postAttrs += ` reply_to="${parentUri}"`;
+): string {
+  if (!post || !post.uri) return '';
+  const indent = '  '.repeat(options.depth);
+  const prefix = options.depth > 0 ? '↳ ' : '';
+  const record = (post.record || {}) as AppBskyFeedPost.Record;
+  const { parentUri, rootUri } = extractReplyRefs(post, options.replyView);
+  const { quote, media } = extractQuoteAndMedia(post);
+
+  const handle = post.author?.handle || post.author?.did || 'unknown';
+  const namePart =
+    post.author?.displayName && post.author.displayName !== handle
+      ? ` (${post.author.displayName})`
+      : '';
+  const createdIso = formatIsoTimestamp(record.createdAt || post.indexedAt);
+  const reqTag = options.isRequestedPost ? ' [REQUESTED]' : '';
+  const repostTag = options.repostBy
+    ? ` [REPOST by @${options.repostBy.handle} at ${formatIsoTimestamp(options.repostBy.indexedAt)}]`
+    : '';
+
+  const lines: string[] = [];
+  lines.push(`${indent}${prefix}[${createdIso}] @${handle}${namePart} — ${post.uri}${reqTag}${repostTag}`);
+
+  const bodyIndent = `${indent}  `;
+  if (parentUri) {
+    const rootPart = rootUri && rootUri !== parentUri ? ` | root: ${rootUri}` : '';
+    lines.push(`${bodyIndent}reply_to: ${parentUri}${rootPart}`);
   }
-  
-  // Start the post tag with all attributes
-  let result = `  <post ${postAttrs}>\n`;
-  
-  // Add post content
-  result += `    <content>\n      ${facetsToMarkdown(record.text, record.facets)}\n    </content>\n`;
-  
-  // Handle quote posts
-  if (post.embed && post.embed.$type === 'app.bsky.embed.record#view') {
-    const embedRecord = post.embed as AppBskyEmbedRecord.View;
-    if (embedRecord.record && embedRecord.record.$type === 'app.bsky.embed.record#viewRecord') {
-      const recordView = embedRecord.record as AppBskyEmbedRecord.ViewRecord;
-      const quotedUrl = createBskyUrl(recordView.uri, recordView.author.handle);
-      const quotedRecord = recordView.value as { text: string; createdAt: string };
-      const quotedPostDate = formatDate(quotedRecord.createdAt);
-      result += `    \n    <quoted_post uri="${recordView.uri}" bsky_url="${quotedUrl}" author_name="${recordView.author.displayName || ''}" author_handle="${recordView.author.handle}" posted_at="${quotedPostDate}">\n`;
-      result += `      <content>\n        ${facetsToMarkdown(quotedRecord.text, (quotedRecord as any).facets)}\n      </content>\n`;
-      result += `      \n      Engagement: ${recordView.likeCount || 0} likes, ${recordView.repostCount || 0} reposts, ${recordView.replyCount || 0} replies\n`;
-      result += `    </quoted_post>\n`;
+
+  const text = facetsToMarkdown(record.text || '', record.facets);
+  if (text) {
+    for (const textLine of text.split('\n')) {
+      lines.push(`${bodyIndent}${textLine}`);
     }
-  }
-  
-  // Add embeds
-  result += formatEmbeds(post, '    ');
-  
-  // Add engagement metrics (without Posted: prefix)
-  result += `    \n    Engagement: ${post.likeCount} likes, ${post.repostCount} reposts, ${post.replyCount} replies${post.quoteCount ? ', ' + post.quoteCount + ' quotes' : ''}\n`;
-  
-  // Close the post tag
-  result += `  </post>`;
-  
-  return result;
-}
-
-/**
- * Format embeds for a post (extracted to a helper function)
- */
-function formatEmbeds(post: AppBskyFeedDefs.PostView, indentation: string = ''): string {
-  let result = '';
-  
-  if (post.embed) {
-    // Images
-    if (post.embed.$type === 'app.bsky.embed.images#view') {
-      const imagesEmbed = post.embed as AppBskyEmbedImages.View;
-      if (imagesEmbed.images) {
-        imagesEmbed.images.forEach((image) => {
-          result += `${indentation}\n${indentation}<embed type="image">\n`;
-          result += `${indentation}  Image description: "${image.alt || 'No description provided'}"\n`;
-          result += `${indentation}  Image URL: ${image.fullsize || image.thumb || ''}\n`;
-          result += `${indentation}</embed>\n`;
-        });
-      }
-    } 
-    // External links
-    else if (post.embed.$type === 'app.bsky.embed.external#view') {
-      const externalEmbed = post.embed as AppBskyEmbedExternal.View;
-      if (externalEmbed.external) {
-        result += `${indentation}\n${indentation}<embed type="link">\n`;
-        result += `${indentation}  Title: "${externalEmbed.external.title}"\n`;
-        result += `${indentation}  URL: ${externalEmbed.external.uri}\n`;
-        result += `${indentation}  Description: "${externalEmbed.external.description}"\n`;
-        result += `${indentation}</embed>\n`;
-      }
-    }
-    // Videos
-    else if (post.embed.$type.includes('video')) {
-      const videoEmbed = post.embed as AppBskyEmbedVideo.View;
-      result += `${indentation}\n${indentation}<embed type="video">\n`;
-      if (videoEmbed.thumbnail) {
-        result += `${indentation}  Thumbnail: ${videoEmbed.thumbnail || ''}\n`;
-      }
-      if (videoEmbed.playlist) {
-        result += `${indentation}  Playlist: ${videoEmbed.playlist || ''}\n`;
-      }
-      result += `${indentation}</embed>\n`;
-    }
-  }
-  
-  return result;
-}
-
-/**
- * Format replies for a post
- */
-function formatReplies(feedItems: AppBskyFeedDefs.FeedViewPost[], parentUri: string): string {
-  // Find direct replies to this post
-  const replies = feedItems.filter(item => 
-    item.reply && 
-    item.reply.parent.$type === 'app.bsky.feed.defs#postView' &&
-    (item.reply.parent as AppBskyFeedDefs.PostView).uri === parentUri
-  );
-  
-  if (replies.length === 0) {
-    return '';
-  }
-  
-  let result = `\n\n    <replies>\n`;
-  
-  for (const reply of replies) {
-    // Format the reply
-    const formattedReply = formatPost(reply);
-    
-    // Indent the reply content to maintain hierarchy
-    const indentedReply = formattedReply
-      .split('\n')
-      .map(line => `      ${line}`)
-      .join('\n');
-    
-    result += indentedReply;
-    
-    // Check for nested replies (recursive)
-    const nestedReplies = formatReplies(feedItems, reply.post.uri);
-    if (nestedReplies) {
-      // Add indentation to nested replies
-      const indentedNestedReplies = nestedReplies
-        .split('\n')
-        .map(line => `  ${line}`)
-        .join('\n');
-      
-      // Insert before the closing post tag
-      const lastPostTagIndex = indentedReply.lastIndexOf('</post>');
-      result = result.substring(0, lastPostTagIndex) + indentedNestedReplies + result.substring(lastPostTagIndex);
-    }
-  }
-  
-  result += `\n    </replies>`;
-  return result;
-}
-
-/**
- * Group feed items into threads
- */
-function groupThreads(feedItems: AppBskyFeedDefs.FeedViewPost[]): { 
-  threads: Map<string, AppBskyFeedDefs.FeedViewPost[]>, 
-  standalone: AppBskyFeedDefs.FeedViewPost[] 
-} {
-  const threads = new Map<string, AppBskyFeedDefs.FeedViewPost[]>();
-  const standalone: AppBskyFeedDefs.FeedViewPost[] = [];
-  
-  for (const item of feedItems) {
-    if (item.reply) {
-      // This is part of a thread
-      const rootUri = item.reply.root.$type === 'app.bsky.feed.defs#postView' ? 
-        (item.reply.root as AppBskyFeedDefs.PostView).uri : '';
-      
-      if (rootUri && !threads.has(rootUri)) {
-        threads.set(rootUri, []);
-      }
-      
-      if (rootUri) {
-        threads.get(rootUri)?.push(item);
-      }
-    } else {
-      // This is a standalone post
-      standalone.push(item);
-    }
-  }
-  
-  return { threads, standalone };
-}
-
-/**
- * Format a complete thread
- */
-function formatThread(feedItems: AppBskyFeedDefs.FeedViewPost[], rootUri: string): string {
-  // Find the root post
-  const rootPost = feedItems.find(item => 
-    item.post.uri === rootUri || 
-    (item.reply && 
-     item.reply.root.$type === 'app.bsky.feed.defs#postView' &&
-     (item.reply.root as AppBskyFeedDefs.PostView).uri === rootUri && 
-     item.reply.parent.$type === 'app.bsky.feed.defs#postView' &&
-     (item.reply.parent as AppBskyFeedDefs.PostView).uri === rootUri)
-  );
-  
-  if (!rootPost) {
-    return '';
-  }
-  
-  // Format the root post
-  let result = formatPost(rootPost);
-  
-  // Add replies
-  const replies = formatReplies(feedItems, rootUri);
-  if (replies) {
-    // Insert before the closing post tag
-    const lastPostTagIndex = result.lastIndexOf('</post>');
-    // If the post is a repost, we need to insert the replies into the nested post
-    if (result.includes('<repost') && result.includes('</post>')) {
-      result = result.substring(0, lastPostTagIndex) + replies + result.substring(lastPostTagIndex);
-    } else {
-      result = result.substring(0, lastPostTagIndex) + replies + result.substring(lastPostTagIndex);
-    }
-  }
-  
-  return result;
-}
-
-/**
- * Preprocess multiple posts into the XML format defined in the spec
- */
-export function preprocessPosts(feedItems: AppBskyFeedDefs.FeedViewPost[]): string {
-  let result = '<posts>\n';
-  
-  // Group into threads and standalone posts
-  const { threads, standalone } = groupThreads(feedItems);
-  
-  // Format threads
-  threads.forEach((items, rootUri) => {
-    result += formatThread(items, rootUri) + '\n\n';
-  });
-  
-  // Format standalone posts
-  standalone.forEach(item => {
-    result += formatPost(item) + '\n\n';
-  });
-  
-  // Remove trailing newlines and add closing tag
-  result = result.trimEnd() + '\n</posts>';
-  
-  return result;
-}
-
-// For backward compatibility
-export function preprocessPost(feedItem: AppBskyFeedDefs.FeedViewPost): string {
-  return formatPost(feedItem);
-}
-
-// For backward compatibility
-export function formatFeed(feed: { items: AppBskyFeedDefs.FeedViewPost[] }): string {
-  return preprocessPosts(feed.items);
-}
-
-/**
- * Format a post thread according to our format spec
- */
-export function formatPostThread(threadView: any): string {
-  // Start building the posts XML container
-  let output = "<posts>\n";
-  
-  // Check if this post has parents that we need to process first
-  if (threadView.parent) {
-    // We need to find the root of the conversation by traversing parent references
-    let currentThreadView = threadView;
-    const parentChain = [];
-    
-    // Collect all parents in the chain (including the original post)
-    parentChain.push(threadView);
-    while (currentThreadView.parent) {
-      parentChain.unshift(currentThreadView.parent); // Add parents to the front to maintain hierarchy
-      currentThreadView = currentThreadView.parent;
-    }
-    
-    // Mark the originally requested post
-    threadView.isRequestedPost = true;
-    
-    // Since we've collected the entire chain, process the root which is the first element
-    output += processThreadViewPostChain(parentChain, 0);
   } else {
-    // No parents, just process the given thread
-    // Mark this as the requested post
-    threadView.isRequestedPost = true;
-    output += processThreadViewPost(threadView, 0);
+    lines.push(`${bodyIndent}(no text)`);
   }
-  
-  // Close the posts container
-  output += "</posts>";
-  
-  return output;
+
+  if (quote) {
+    lines.push(...renderQuoteCompact(quote, bodyIndent));
+  }
+  if (media.length > 0) {
+    lines.push(...renderMediaCompact(media, bodyIndent));
+  }
+
+  const l = post.likeCount ?? 0;
+  const rp = post.repostCount ?? 0;
+  const r = post.replyCount ?? 0;
+  const q = post.quoteCount ?? 0;
+  if (l > 0 || rp > 0 || r > 0 || q > 0) {
+    lines.push(`${bodyIndent}metrics: ${l}L ${rp}RP ${r}R${q ? ` ${q}Q` : ''}`);
+  }
+
+  let block = lines.join('\n');
+  if (options.childrenCompact) {
+    block += `\n${options.childrenCompact}`;
+  }
+  return block;
+}
+
+interface FeedTreeNode {
+  kind: 'post';
+  uri: string;
+  item: AppBskyFeedDefs.FeedViewPost;
+  createdMs: number;
+  children: FeedTreeNode[];
+}
+
+type TopLevelEntry =
+  | { kind: 'repost'; item: AppBskyFeedDefs.FeedViewPost }
+  | FeedTreeNode;
+
+/**
+ * Build a lossless forest from FeedViewPost items:
+ * - Reposts stay top-level `<repost>` items (unless excluded).
+ * - Non-repost items attach to `parentUri` ONLY when `parentUri` is actually present
+ *   in `feedItems` (preventing orphaned deep replies from ever being dropped!).
+ * - Any reply whose immediate parent is not in `feedItems` is emitted at the top level
+ *   with `reply_to` and `root_uri` preserved, and any of its own descendants in `feedItems`
+ *   nest cleanly underneath it.
+ */
+function buildFeedForest(
+  feedItems: AppBskyFeedDefs.FeedViewPost[],
+  includeReposts: boolean
+): TopLevelEntry[] {
+  const byUri = new Map<string, FeedTreeNode>();
+  const orderedCandidates: Array<{ kind: 'repost'; item: AppBskyFeedDefs.FeedViewPost } | { kind: 'node'; node: FeedTreeNode }> = [];
+
+  for (const item of feedItems) {
+    if (!item?.post?.uri) continue;
+    const isRepost = item.reason?.$type === 'app.bsky.feed.defs#reasonRepost';
+
+    if (isRepost) {
+      if (includeReposts) {
+        orderedCandidates.push({ kind: 'repost', item });
+      }
+      continue;
+    }
+
+    if (byUri.has(item.post.uri)) {
+      continue; // Deduplicate identical post URIs within the same batch
+    }
+
+    const rec = item.post.record as AppBskyFeedPost.Record | undefined;
+    const ts = rec?.createdAt || item.post.indexedAt || '';
+    const ms = ts ? new Date(ts).getTime() : 0;
+    const node: FeedTreeNode = {
+      kind: 'post',
+      uri: item.post.uri,
+      item,
+      createdMs: Number.isNaN(ms) ? 0 : ms,
+      children: [],
+    };
+    byUri.set(node.uri, node);
+    orderedCandidates.push({ kind: 'node', node });
+  }
+
+  const attachedUris = new Set<string>();
+
+  for (const node of byUri.values()) {
+    const { parentUri } = extractReplyRefs(node.item.post, node.item.reply);
+    if (parentUri && parentUri !== node.uri && byUri.has(parentUri)) {
+      // Guard against pathological cycles
+      let cursor: FeedTreeNode | undefined = byUri.get(parentUri);
+      let hasCycle = false;
+      while (cursor) {
+        if (cursor.uri === node.uri) {
+          hasCycle = true;
+          break;
+        }
+        const nextParent = extractReplyRefs(cursor.item.post, cursor.item.reply).parentUri;
+        cursor = nextParent && nextParent !== cursor.uri ? byUri.get(nextParent) : undefined;
+      }
+      if (!hasCycle) {
+        byUri.get(parentUri)!.children.push(node);
+        attachedUris.add(node.uri);
+      }
+    }
+  }
+
+  // Sort nested child replies chronologically (oldest -> newest) for natural reading order
+  for (const node of byUri.values()) {
+    if (node.children.length > 1) {
+      node.children.sort((a, b) => a.createdMs - b.createdMs);
+    }
+  }
+
+  const topLevel: TopLevelEntry[] = [];
+  for (const entry of orderedCandidates) {
+    if (entry.kind === 'repost') {
+      topLevel.push(entry);
+    } else if (!attachedUris.has(entry.node.uri)) {
+      topLevel.push(entry.node);
+    }
+  }
+
+  return topLevel;
+}
+
+function renderFeedNodeXml(node: FeedTreeNode, indentLevel: number): string {
+  const childrenXml =
+    node.children.length > 0
+      ? node.children.map((c) => renderFeedNodeXml(c, indentLevel + 2)).join('')
+      : undefined;
+  return renderPostXml(node.item.post, {
+    indentLevel,
+    replyView: node.item.reply,
+    childrenXml,
+  });
+}
+
+function renderFeedNodeCompact(node: FeedTreeNode, depth: number): string {
+  const childrenCompact =
+    node.children.length > 0
+      ? node.children.map((c) => renderFeedNodeCompact(c, depth + 1)).join('\n')
+      : undefined;
+  return renderPostCompact(node.item.post, {
+    depth,
+    replyView: node.item.reply,
+    childrenCompact,
+  });
 }
 
 /**
- * Process a chain of posts with parent-child relationships
- * This is used for the parent chain in getPostThread response
+ * Format a single FeedViewPost item.
  */
-function processThreadViewPostChain(postChain: any[], indentLevel: number): string {
-  if (!postChain || !postChain.length) {
-    return '';
+export function preprocessPost(
+  feedItem: AppBskyFeedDefs.FeedViewPost,
+  options: PreprocessOptions = {}
+): string {
+  const detail = options.detail ?? 'full';
+  const isRepost = feedItem.reason?.$type === 'app.bsky.feed.defs#reasonRepost';
+
+  if (detail === 'compact') {
+    if (isRepost) {
+      const reasonRepost = feedItem.reason as AppBskyFeedDefs.ReasonRepost;
+      return renderPostCompact(feedItem.post, {
+        depth: 0,
+        replyView: feedItem.reply,
+        repostBy: {
+          handle: reasonRepost.by.handle,
+          displayName: reasonRepost.by.displayName,
+          indexedAt: reasonRepost.indexedAt,
+        },
+      });
+    }
+    return renderPostCompact(feedItem.post, { depth: 0, replyView: feedItem.reply });
   }
-  
-  // Start with the root post
-  const rootPost = postChain[0];
-  const indent = '  '.repeat(indentLevel);
-  let output = '';
-  
-  try {
-    const post = rootPost.post;
-    if (!post) return '';
-    
-    // Determine post type (standalone, reply, quote)
-    const record = post.record;
-    if (!record) {
-      console.error('Record missing for post:', post.uri);
-      return '';
-    }
-    
-    const isReply = record.reply != null;
-    const isQuote = post.embed?.$type === 'app.bsky.embed.record#view';
-    
-    let postType = 'standalone';
-    if (isReply) postType = 'reply';
-    if (isQuote) {
-      postType = isReply ? 'reply,quote' : 'quote';
-    }
-    
-    // Check for required fields
-    if (!post.uri) {
-      console.error('URI missing for post');
-      return '';
-    }
-    
-    if (!post.author || !post.author.handle) {
-      console.error('Author or handle missing for post:', post.uri);
-      return '';
-    }
-    
-    // Start building post tag attributes
-    let postAttrs = `type="${postType}" uri="${post.uri}" bsky_url="https://bsky.app/profile/${post.author.handle}/post/${post.uri.split('/').pop()}" `;
-    postAttrs += `author_name="${escapeXml(post.author.displayName || post.author.handle)}" author_handle="${post.author.handle}" `;
-    postAttrs += `posted_at="${new Date(post.indexedAt || record.createdAt).toLocaleString()}"`;
-    
-    // Add reply_to attribute if it's a reply
-    if (isReply && record.reply && record.reply.parent && record.reply.parent.uri) {
-      postAttrs += ` reply_to="${record.reply.parent.uri}"`;
-    }
-    
-    // If this is the originally requested post, mark it
-    if (rootPost.isRequestedPost) {
-      postAttrs += ` requested="true"`;
-    }
-    
-    // Format the post opening tag with all attributes
-    output += `${indent}<post ${postAttrs}>\n`;
-    
-    // Add content, using facetsToMarkdown to properly handle links, mentions, hashtags
-    output += `${indent}  <content>\n${indent}    ${facetsToMarkdown(record.text || '', record.facets)}\n${indent}  </content>\n`;
-    
-    // Add quoted post if present
-    if (isQuote && post.embed && post.embed.record) {
-      const quoted = post.embed.record;
-      if (quoted.uri && quoted.author && quoted.author.handle) {
-        output += `${indent}  <quoted_post uri="${quoted.uri}" `;
-        output += `bsky_url="https://bsky.app/profile/${quoted.author.handle}/post/${quoted.uri.split('/').pop()}" `;
-        output += `author_name="${escapeXml(quoted.author.displayName || quoted.author.handle)}" `;
-        output += `author_handle="${quoted.author.handle}" `;
-        output += `posted_at="${new Date(quoted.indexedAt || Date.now()).toLocaleString()}">\n`;
-        
-        // Use facetsToMarkdown for quoted content as well
-        output += `${indent}    <content>\n${indent}      ${facetsToMarkdown((quoted.value && quoted.value.text) || '', (quoted.value && quoted.value.facets) || [])}\n${indent}    </content>\n`;
-        
-        // Add engagement metrics for quoted post
-        if (quoted.likeCount || quoted.repostCount || quoted.replyCount) {
-          output += `${indent}    Engagement: ${quoted.likeCount || 0} likes, ${quoted.repostCount || 0} reposts, ${quoted.replyCount || 0} replies`;
-          if (quoted.quoteCount) output += `, ${quoted.quoteCount} quotes`;
-          output += '\n';
-        }
-        
-        output += `${indent}  </quoted_post>\n`;
-      }
-    }
-    
-    // Add embeds if present
-    if (post.embed && post.embed.$type !== 'app.bsky.embed.record#view') {
-      // Handle images
-      if (post.embed.$type === 'app.bsky.embed.images#view') {
-        const images = post.embed.images || [];
-        for (const image of images) {
-          if (!image) continue;
-          output += `${indent}  <embed type="image">\n`;
-          if (image.alt) {
-            output += `${indent}    Image description: "${escapeXml(image.alt)}"\n`;
-          }
-          if (image.fullsize || image.thumb) {
-            output += `${indent}    URL: ${image.fullsize || image.thumb}\n`;
-          }
-          output += `${indent}  </embed>\n`;
-        }
-      }
-      // Handle external links
-      else if (post.embed.$type === 'app.bsky.embed.external#view' && post.embed.external) {
-        output += `${indent}  <embed type="link">\n`;
-        if (post.embed.external.title) {
-          output += `${indent}    Title: "${escapeXml(post.embed.external.title)}"\n`;
-        }
-        if (post.embed.external.uri) {
-          output += `${indent}    URL: ${post.embed.external.uri}\n`;
-        }
-        if (post.embed.external.description) {
-          output += `${indent}    Description: "${escapeXml(post.embed.external.description)}"\n`;
-        }
-        if (post.embed.external.thumb) {
-          output += `${indent}    Thumbnail: ${post.embed.external.thumb}\n`;
-        }
-        output += `${indent}  </embed>\n`;
-      }
-      // Handle videos
-      else if (post.embed.$type === 'app.bsky.embed.video#view' && post.embed.video) {
-        output += `${indent}  <embed type="video">\n`;
-        if (post.embed.video.alt) {
-          output += `${indent}    Video description: ${escapeXml(post.embed.video.alt)}\n`;
-        }
-        if (post.embed.video.thumb) {
-          output += `${indent}    Thumbnail: ${post.embed.video.thumb}\n`;
-        }
-        if (post.embed.video.url) {
-          output += `${indent}    URL: ${post.embed.video.url}\n`;
-        }
-        output += `${indent}  </embed>\n`;
-      }
-    }
-    
-    // Add engagement metrics
-    if (post.likeCount || post.repostCount || post.replyCount) {
-      output += `${indent}  Engagement: ${post.likeCount || 0} likes, ${post.repostCount || 0} reposts, ${post.replyCount || 0} replies`;
-      if (post.quoteCount) output += `, ${post.quoteCount} quotes`;
-      output += '\n';
-    }
-    
-    // Handle replies: first check normal replies array
-    if (rootPost.replies && Array.isArray(rootPost.replies) && rootPost.replies.length > 0) {
-      output += `${indent}  <replies>\n`;
-      for (const reply of rootPost.replies) {
-        output += processThreadViewPost(reply, indentLevel + 2);
-      }
-      output += `${indent}  </replies>\n`;
-    } 
-    // If this is not the last post in the chain, add the next post as a reply
-    else if (postChain.length > 1) {
-      output += `${indent}  <replies>\n`;
-      const remainingChain = postChain.slice(1);
-      output += processThreadViewPostChain(remainingChain, indentLevel + 2);
-      output += `${indent}  </replies>\n`;
-    }
-    
-    output += `${indent}</post>\n`;
-  } catch (error) {
-    console.error(`Error processing post chain: ${error instanceof Error ? error.message : String(error)}`);
-    return ''; // Skip this post if there's an error
+
+  if (isRepost) {
+    const reasonRepost = feedItem.reason as AppBskyFeedDefs.ReasonRepost;
+    const repostedAt = formatIsoTimestamp(reasonRepost.indexedAt);
+    let out = `  <repost author_name="${escapeXml(reasonRepost.by.displayName || '')}" author_handle="${escapeXml(reasonRepost.by.handle)}" reposted_at="${escapeXml(repostedAt)}">\n`;
+    out += renderPostXml(feedItem.post, { indentLevel: 2, replyView: feedItem.reply });
+    out += `  </repost>`;
+    return out;
   }
-  
-  return output;
+
+  return renderPostXml(feedItem.post, { indentLevel: 1, replyView: feedItem.reply }).trimEnd();
 }
 
 /**
- * Process a single post and all of its replies in the thread
+ * Preprocess multiple FeedViewPost items into well-formed XML (`detail: "full"`)
+ * or token-efficient compact blocks (`detail: "compact"`), with zero dropped replies.
  */
-export function processThreadViewPost(threadViewPost: any, indentLevel: number): string {
-  if (!threadViewPost || threadViewPost.$type !== 'app.bsky.feed.defs#threadViewPost') {
-    return '';
+export function preprocessPosts(
+  feedItems: AppBskyFeedDefs.FeedViewPost[],
+  options: PreprocessOptions = {}
+): string {
+  const detail = options.detail ?? 'full';
+  const includeReposts = options.includeReposts ?? true;
+  const topLevel = buildFeedForest(feedItems, includeReposts);
+
+  if (detail === 'compact') {
+    if (topLevel.length === 0) return '';
+    return topLevel
+      .map((entry) => {
+        if (entry.kind === 'repost') {
+          const reasonRepost = entry.item.reason as AppBskyFeedDefs.ReasonRepost;
+          return renderPostCompact(entry.item.post, {
+            depth: 0,
+            replyView: entry.item.reply,
+            repostBy: {
+              handle: reasonRepost.by.handle,
+              displayName: reasonRepost.by.displayName,
+              indexedAt: reasonRepost.indexedAt,
+            },
+          });
+        }
+        return renderFeedNodeCompact(entry, 0);
+      })
+      .join('\n\n');
   }
-  
-  const post = threadViewPost.post;
-  if (!post) return '';
-  
-  const indent = '  '.repeat(indentLevel);
-  let output = '';
-  
-  try {
-    // Determine post type (standalone, reply, quote)
-    const record = post.record;
-    if (!record) {
-      console.error('Record missing for post:', post.uri);
-      return '';
+
+  const blocks: string[] = [];
+  for (const entry of topLevel) {
+    if (entry.kind === 'repost') {
+      blocks.push(preprocessPost(entry.item, { detail: 'full' }));
+    } else {
+      blocks.push(renderFeedNodeXml(entry, 1).trimEnd());
     }
-    
-    const isReply = record.reply != null;
-    const isQuote = post.embed?.$type === 'app.bsky.embed.record#view';
-    
-    let postType = 'standalone';
-    if (isReply) postType = 'reply';
-    if (isQuote) {
-      postType = isReply ? 'reply,quote' : 'quote';
-    }
-    
-    // Check for required fields
-    if (!post.uri) {
-      console.error('URI missing for post');
-      return '';
-    }
-    
-    if (!post.author || !post.author.handle) {
-      console.error('Author or handle missing for post:', post.uri);
-      return '';
-    }
-    
-    // Start building post tag attributes
-    let postAttrs = `type="${postType}" uri="${post.uri}" bsky_url="https://bsky.app/profile/${post.author.handle}/post/${post.uri.split('/').pop()}" `;
-    postAttrs += `author_name="${escapeXml(post.author.displayName || post.author.handle)}" author_handle="${post.author.handle}" `;
-    postAttrs += `posted_at="${new Date(post.indexedAt || record.createdAt).toLocaleString()}"`;
-    
-    // Add reply_to attribute if it's a reply
-    if (isReply && record.reply && record.reply.parent && record.reply.parent.uri) {
-      postAttrs += ` reply_to="${record.reply.parent.uri}"`;
-    }
-    
-    // If this is the originally requested post, mark it
-    if (threadViewPost.isRequestedPost) {
-      postAttrs += ` requested="true"`;
-    }
-    
-    // Format the post opening tag with all attributes
-    output += `${indent}<post ${postAttrs}>\n`;
-    
-    // Add content, using facetsToMarkdown to properly handle links, mentions, hashtags
-    output += `${indent}  <content>\n${indent}    ${facetsToMarkdown(record.text || '', record.facets)}\n${indent}  </content>\n`;
-    
-    // Add quoted post if present
-    if (isQuote && post.embed && post.embed.record) {
-      const quoted = post.embed.record;
-      if (quoted.uri && quoted.author && quoted.author.handle) {
-        output += `${indent}  <quoted_post uri="${quoted.uri}" `;
-        output += `bsky_url="https://bsky.app/profile/${quoted.author.handle}/post/${quoted.uri.split('/').pop()}" `;
-        output += `author_name="${escapeXml(quoted.author.displayName || quoted.author.handle)}" `;
-        output += `author_handle="${quoted.author.handle}" `;
-        output += `posted_at="${new Date(quoted.indexedAt || Date.now()).toLocaleString()}">\n`;
-        
-        // Use facetsToMarkdown for quoted content as well
-        output += `${indent}    <content>\n${indent}      ${facetsToMarkdown((quoted.value && quoted.value.text) || '', (quoted.value && quoted.value.facets) || [])}\n${indent}    </content>\n`;
-        
-        // Add engagement metrics for quoted post
-        if (quoted.likeCount || quoted.repostCount || quoted.replyCount) {
-          output += `${indent}    Engagement: ${quoted.likeCount || 0} likes, ${quoted.repostCount || 0} reposts, ${quoted.replyCount || 0} replies`;
-          if (quoted.quoteCount) output += `, ${quoted.quoteCount} quotes`;
-          output += '\n';
-        }
-        
-        output += `${indent}  </quoted_post>\n`;
-      }
-    }
-    
-    // Add embeds if present
-    if (post.embed && post.embed.$type !== 'app.bsky.embed.record#view') {
-      // Handle images
-      if (post.embed.$type === 'app.bsky.embed.images#view') {
-        const images = post.embed.images || [];
-        for (const image of images) {
-          if (!image) continue;
-          output += `${indent}  <embed type="image">\n`;
-          if (image.alt) {
-            output += `${indent}    Image description: "${escapeXml(image.alt)}"\n`;
-          }
-          if (image.fullsize || image.thumb) {
-            output += `${indent}    URL: ${image.fullsize || image.thumb}\n`;
-          }
-          output += `${indent}  </embed>\n`;
-        }
-      }
-      // Handle external links
-      else if (post.embed.$type === 'app.bsky.embed.external#view' && post.embed.external) {
-        output += `${indent}  <embed type="link">\n`;
-        if (post.embed.external.title) {
-          output += `${indent}    Title: "${escapeXml(post.embed.external.title)}"\n`;
-        }
-        if (post.embed.external.uri) {
-          output += `${indent}    URL: ${post.embed.external.uri}\n`;
-        }
-        if (post.embed.external.description) {
-          output += `${indent}    Description: "${escapeXml(post.embed.external.description)}"\n`;
-        }
-        if (post.embed.external.thumb) {
-          output += `${indent}    Thumbnail: ${post.embed.external.thumb}\n`;
-        }
-        output += `${indent}  </embed>\n`;
-      }
-      // Handle videos
-      else if (post.embed.$type === 'app.bsky.embed.video#view' && post.embed.video) {
-        output += `${indent}  <embed type="video">\n`;
-        if (post.embed.video.alt) {
-          output += `${indent}    Video description: ${escapeXml(post.embed.video.alt)}\n`;
-        }
-        if (post.embed.video.thumb) {
-          output += `${indent}    Thumbnail: ${post.embed.video.thumb}\n`;
-        }
-        if (post.embed.video.url) {
-          output += `${indent}    URL: ${post.embed.video.url}\n`;
-        }
-        output += `${indent}  </embed>\n`;
-      }
-    }
-    
-    // Add engagement metrics
-    if (post.likeCount || post.repostCount || post.replyCount) {
-      output += `${indent}  Engagement: ${post.likeCount || 0} likes, ${post.repostCount || 0} reposts, ${post.replyCount || 0} replies`;
-      if (post.quoteCount) output += `, ${post.quoteCount} quotes`;
-      output += '\n';
-    }
-    
-    // Process replies recursively if present
-    if (threadViewPost.replies && Array.isArray(threadViewPost.replies) && threadViewPost.replies.length > 0) {
-      output += `${indent}  <replies>\n`;
-      for (const reply of threadViewPost.replies) {
-        output += processThreadViewPost(reply, indentLevel + 2);
-      }
-      output += `${indent}  </replies>\n`;
-    }
-    
-    output += `${indent}</post>\n`;
-  } catch (error) {
-    console.error(`Error processing post: ${error instanceof Error ? error.message : String(error)}`);
-    return ''; // Skip this post if there's an error
   }
-  
-  return output;
+
+  if (blocks.length === 0) {
+    return '<posts>\n</posts>';
+  }
+
+  return `<posts>\n${blocks.join('\n\n')}\n</posts>`;
 }
 
+// For backward compatibility
+export function formatFeed(
+  feed: { items: AppBskyFeedDefs.FeedViewPost[] },
+  options: PreprocessOptions = {}
+): string {
+  return preprocessPosts(feed.items, options);
+}
 
+/**
+ * Render a thread node (including `#notFoundPost` and `#blockedPost` placeholders) in XML.
+ */
+export function processThreadViewPost(
+  threadViewPost: any,
+  indentLevel: number,
+  options: ThreadFormatOptions = {}
+): string {
+  if (!threadViewPost || typeof threadViewPost !== 'object') return '';
+  const indent = '  '.repeat(indentLevel);
+  const type = typeof threadViewPost.$type === 'string' ? threadViewPost.$type : '';
+
+  if (type === 'app.bsky.feed.defs#notFoundPost' || threadViewPost.notFound) {
+    const uri = threadViewPost.uri || '';
+    return `${indent}<post uri="${escapeXml(uri)}" status="not_found" />\n`;
+  }
+  if (type === 'app.bsky.feed.defs#blockedPost' || threadViewPost.blocked) {
+    const uri = threadViewPost.uri || '';
+    return `${indent}<post uri="${escapeXml(uri)}" status="blocked" />\n`;
+  }
+  if (type && type !== 'app.bsky.feed.defs#threadViewPost') {
+    return '';
+  }
+  if (!threadViewPost.post) return '';
+
+  let childrenXml: string | undefined;
+  if (Array.isArray(threadViewPost.replies) && threadViewPost.replies.length > 0) {
+    const max = options.maxRepliesPerNode;
+    const slice = max ? threadViewPost.replies.slice(0, max) : threadViewPost.replies;
+    const omitted = threadViewPost.replies.length - slice.length;
+    let buf = '';
+    for (const reply of slice) {
+      buf += processThreadViewPost(reply, indentLevel + 2, options);
+    }
+    if (omitted > 0) {
+      buf += `${'  '.repeat(indentLevel + 2)}<omitted_replies count="${omitted}" />\n`;
+    }
+    if (buf) childrenXml = buf;
+  }
+
+  return renderPostXml(threadViewPost.post, {
+    indentLevel,
+    isRequestedPost: Boolean(threadViewPost.isRequestedPost),
+    childrenXml,
+  });
+}
+
+/**
+ * Render an ancestor chain (`root -> ... -> requestedPost`) in XML without dropping
+ * children if an ancestor was deleted (`#notFoundPost`) or blocked (`#blockedPost`).
+ */
+function processThreadChainXml(
+  chain: any[],
+  indentLevel: number,
+  options: ThreadFormatOptions
+): string {
+  if (!chain.length) return '';
+  const head = chain[0];
+  const rest = chain.slice(1);
+  const indent = '  '.repeat(indentLevel);
+
+  if (rest.length === 0) {
+    return processThreadViewPost(head, indentLevel, options);
+  }
+
+  const childChainXml = processThreadChainXml(rest, indentLevel + 2, options);
+  const type = typeof head?.$type === 'string' ? head.$type : '';
+
+  if (type === 'app.bsky.feed.defs#notFoundPost' || head?.notFound || !head?.post) {
+    const status = type === 'app.bsky.feed.defs#blockedPost' || head?.blocked ? 'blocked' : 'not_found';
+    const uri = head?.uri || '';
+    return (
+      `${indent}<post uri="${escapeXml(uri)}" status="${status}">\n` +
+      `${indent}  <replies>\n${childChainXml}${indent}  </replies>\n` +
+      `${indent}</post>\n`
+    );
+  }
+
+  return renderPostXml(head.post, {
+    indentLevel,
+    isRequestedPost: Boolean(head.isRequestedPost),
+    childrenXml: childChainXml,
+  });
+}
+
+function processThreadNodeCompact(
+  node: any,
+  depth: number,
+  options: ThreadFormatOptions
+): string {
+  if (!node || typeof node !== 'object') return '';
+  const indent = '  '.repeat(depth);
+  const prefix = depth > 0 ? '↳ ' : '';
+  const type = typeof node.$type === 'string' ? node.$type : '';
+
+  if (type === 'app.bsky.feed.defs#notFoundPost' || node.notFound) {
+    return `${indent}${prefix}[not_found] ${node.uri || ''}`;
+  }
+  if (type === 'app.bsky.feed.defs#blockedPost' || node.blocked) {
+    return `${indent}${prefix}[blocked] ${node.uri || ''}`;
+  }
+  if (!node.post) return '';
+
+  let childrenCompact: string | undefined;
+  if (Array.isArray(node.replies) && node.replies.length > 0) {
+    const max = options.maxRepliesPerNode;
+    const slice = max ? node.replies.slice(0, max) : node.replies;
+    const omitted = node.replies.length - slice.length;
+    const rendered = slice
+      .map((r: any) => processThreadNodeCompact(r, depth + 1, options))
+      .filter(Boolean);
+    if (omitted > 0) {
+      rendered.push(`${'  '.repeat(depth + 1)}↳ [+${omitted} more direct replies omitted]`);
+    }
+    if (rendered.length > 0) {
+      childrenCompact = rendered.join('\n');
+    }
+  }
+
+  return renderPostCompact(node.post, {
+    depth,
+    isRequestedPost: Boolean(node.isRequestedPost),
+    childrenCompact,
+  });
+}
+
+function processThreadChainCompact(
+  chain: any[],
+  depth: number,
+  options: ThreadFormatOptions
+): string {
+  if (!chain.length) return '';
+  const head = chain[0];
+  const rest = chain.slice(1);
+
+  if (rest.length === 0) {
+    return processThreadNodeCompact(head, depth, options);
+  }
+
+  const childCompact = processThreadChainCompact(rest, depth + 1, options);
+  const indent = '  '.repeat(depth);
+  const prefix = depth > 0 ? '↳ ' : '';
+  const type = typeof head?.$type === 'string' ? head.$type : '';
+
+  if (type === 'app.bsky.feed.defs#notFoundPost' || head?.notFound || !head?.post) {
+    const status = type === 'app.bsky.feed.defs#blockedPost' || head?.blocked ? 'blocked' : 'not_found';
+    return `${indent}${prefix}[${status}] ${head?.uri || ''}\n${childCompact}`;
+  }
+
+  return renderPostCompact(head.post, {
+    depth,
+    isRequestedPost: Boolean(head.isRequestedPost),
+    childrenCompact: childCompact,
+  });
+}
+
+/**
+ * Format a `getPostThread` response tree in full XML or compact mode.
+ */
+export function formatPostThread(
+  threadView: any,
+  options: ThreadFormatOptions = {}
+): string {
+  const detail = options.detail ?? 'full';
+
+  if (!threadView || typeof threadView !== 'object') {
+    return detail === 'compact' ? '' : '<posts>\n</posts>';
+  }
+
+  // Clone shallowly along the parent chain so we don't mutate caller fixtures permanently
+  const chain: any[] = [{ ...threadView, isRequestedPost: true }];
+  let cursor = threadView.parent;
+  const seen = new Set<any>([threadView]);
+  while (cursor && typeof cursor === 'object' && !seen.has(cursor)) {
+    seen.add(cursor);
+    chain.unshift(cursor);
+    cursor = cursor.parent;
+  }
+
+  if (detail === 'compact') {
+    return processThreadChainCompact(chain, 0, options);
+  }
+
+  const inner = processThreadChainXml(chain, 1, options);
+  return `<posts>\n${inner}</posts>`;
+}

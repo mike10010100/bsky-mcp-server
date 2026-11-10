@@ -10,6 +10,7 @@
     "dev": "tsc && node build/src/index.js",
     "test": "pnpm run build && node build/test/final-test.js",
     "test:registration": "pnpm run build && node build/test/register-tools.test.js",
+    "test:regressions": "pnpm run build && node build/test/regressions-and-exploration.test.js",
     "test:remote": "pnpm run build && node build/test/remote-oauth.test.js",
     "test:get-thread": "pnpm run build && node build/test/tools/test-get-post-thread.js",
     "test:url-converter": "pnpm run build && node build/test/url-converter/test-url-converter.js",
