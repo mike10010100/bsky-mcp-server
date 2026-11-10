@@ -165,30 +165,59 @@ export function cleanHandle(input: string): string {
  * Convert Bluesky post text + facets into Markdown
  * @param text The post text content
  * @param facets Optional array of facets from the post
+ * @param options Optional formatting flags (e.g. xmlSafe to escape XML entities)
  * @returns Markdown formatted text with proper links and mentions
  */
-export function facetsToMarkdown(text: string, facets?: any[]): string {
+export function facetsToMarkdown(
+  text: string,
+  facets?: any[],
+  options?: { xmlSafe?: boolean }
+): string {
   if (!text) return '';
-  
-  // Initialize RichText with the text and facets
-  const rt = new RichText({ text, facets: facets ?? [] });
-  
-  // Transform segments into Markdown
+
   let markdown = '';
-  for (const segment of rt.segments()) {
-    if (segment.isLink()) {
-      //markdown += `[${segment.text}](${segment.link?.uri})`;
-      markdown += `<${segment.link?.uri}>`; // use the markdown auto-link syntax for simplicity for the LLM instead of linking the text fragment
-    } else if (segment.isMention()) {
-      markdown += `[${segment.text}](https://bsky.app/profile/${segment.mention?.did})`;
-    } else if (segment.isTag()) {
-      markdown += `#${segment.tag?.tag}`;
-    } else {
-      markdown += segment.text;
+  try {
+    const rt = new RichText({ text, facets: facets ?? [] });
+    for (const segment of rt.segments()) {
+      if (segment.isLink() && segment.link?.uri) {
+        const uri = segment.link.uri;
+        const strippedText = segment.text.replace(/^https?:\/\//i, '').replace(/\.{2,}$|…$/u, '');
+        const strippedUri = uri.replace(/^https?:\/\//i, '');
+        if (!segment.text || strippedUri.startsWith(strippedText)) {
+          markdown += uri;
+        } else {
+          markdown += `[${segment.text}](${uri})`;
+        }
+      } else if (segment.isMention() && segment.mention?.did) {
+        markdown += `[${segment.text}](https://bsky.app/profile/${segment.mention.did})`;
+      } else if (segment.isTag() && segment.tag?.tag) {
+        markdown += `#${segment.tag.tag}`;
+      } else {
+        markdown += segment.text;
+      }
     }
+  } catch {
+    markdown = text;
   }
-  
-  return markdown;
+
+  return options?.xmlSafe ? escapeXml(markdown) : markdown;
+}
+
+/**
+ * Formats any timestamp string/Date into a canonical ISO-8601 UTC string.
+ * Falls back to the original string if parsing fails.
+ */
+export function formatIsoTimestamp(dateInput?: string | Date | null): string {
+  if (!dateInput) return '';
+  try {
+    const d = dateInput instanceof Date ? dateInput : new Date(dateInput);
+    if (Number.isNaN(d.getTime())) {
+      return typeof dateInput === 'string' ? dateInput : '';
+    }
+    return d.toISOString();
+  } catch {
+    return typeof dateInput === 'string' ? dateInput : '';
+  }
 }
 
 
@@ -259,13 +288,16 @@ export function debugPostStructure(post: any): void {
 }
 
 /**
- * Helper function to escape XML special characters
- * @param unsafe The string to escape 
- * @returns The escaped string
+ * Helper function to escape XML special characters and strip control bytes
+ * that are illegal in XML 1.0 (`0x00-0x08`, `0x0B`, `0x0C`, `0x0E-0x1F`, `0xFFFE`, `0xFFFF`).
+ * @param unsafe The string to escape
+ * @returns Well-formed XML-safe string
  */
 export function escapeXml(unsafe: string): string {
   if (!unsafe) return '';
+  // eslint-disable-next-line no-control-regex
   return unsafe
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\uFFFE\uFFFF]/g, '')
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
@@ -298,29 +330,129 @@ export function parseBskyUrl(url: string): { handle: string, rkey: string } | nu
   }
 }
 
+const AT_POST_URI_RE = /^at:\/\/(did:[a-z0-9]+:[A-Za-z0-9._:%-]+)\/app\.bsky\.feed\.post\/([A-Za-z0-9._~-]+)$/;
+
+/**
+ * Check whether a string is a valid AT URI for a Bluesky post (supports did:plc:, did:web:, etc.)
+ */
+export function isValidPostAtUri(uri: string): boolean {
+  return AT_POST_URI_RE.test(uri.trim());
+}
+
 /**
  * Convert a Bluesky post URL to an AT URI
  * @param url The Bluesky web URL (e.g., https://bsky.app/profile/username.bsky.social/post/postid)
  * @param agent The Agent instance to use for handle resolution
+ * @param handleCache Optional handle -> DID cache for batch conversions
  * @returns The AT URI or null if conversion failed
  */
-export async function convertBskyUrlToAtUri(url: string, agent: Agent): Promise<string | null> {
+export async function convertBskyUrlToAtUri(
+  url: string,
+  agent: Agent,
+  handleCache?: Map<string, string>
+): Promise<string | null> {
   try {
     const parsed = parseBskyUrl(url);
     if (!parsed) return null;
-    
-    // Resolve the handle to a DID
-    const resolveResponse = await agent.resolveHandle({ handle: parsed.handle });
-    
-    if (!resolveResponse.success) {
-      return null;
+
+    const actor = cleanHandle(parsed.handle);
+    let did: string | undefined;
+
+    if (actor.startsWith('did:')) {
+      did = actor;
+    } else if (handleCache?.has(actor.toLowerCase())) {
+      did = handleCache.get(actor.toLowerCase());
+    } else {
+      const resolveResponse = await agent.resolveHandle({ handle: actor });
+      if (!resolveResponse.success || !resolveResponse.data?.did) {
+        return null;
+      }
+      did = resolveResponse.data.did;
+      handleCache?.set(actor.toLowerCase(), did);
     }
 
-    const did = resolveResponse.data.did;
-
-    // Construct the AT URI
+    if (!did) return null;
     return `at://${did}/app.bsky.feed.post/${parsed.rkey}`;
-  } catch (error) {
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Normalize either an AT post URI (did:plc / did:web) or a Bluesky web URL into an AT post URI.
+ */
+export async function normalizePostUri(
+  input: string,
+  agent: Agent,
+  handleCache?: Map<string, string>
+): Promise<string | null> {
+  if (!input) return null;
+  const trimmed = input.trim().replace(/^@/, '');
+  if (isValidPostAtUri(trimmed)) {
+    return trimmed;
+  }
+  if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
+    return await convertBskyUrlToAtUri(trimmed, agent, handleCache);
+  }
+  return null;
+}
+
+const pdsEndpointCache = new Map<string, { endpoint: string; expiresAt: number }>();
+const PDS_CACHE_TTL_MS = 10 * 60 * 1000;
+
+/**
+ * Resolve the ATProto PDS base URL (e.g. https://inkcap.us-east.host.bsky.network)
+ * from a user's DID document (`did:plc:` via plc.directory or `did:web:` via .well-known/did.json).
+ */
+export async function resolvePdsEndpoint(did: string): Promise<string | null> {
+  const cached = pdsEndpointCache.get(did);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.endpoint;
+  }
+
+  let didDocUrl: string;
+  if (did.startsWith('did:plc:')) {
+    didDocUrl = `https://plc.directory/${encodeURIComponent(did)}`;
+  } else if (did.startsWith('did:web:')) {
+    const rawDomain = did.slice('did:web:'.length);
+    const parts = rawDomain.split(':').map(decodeURIComponent);
+    if (parts.length === 1) {
+      didDocUrl = `https://${parts[0]}/.well-known/did.json`;
+    } else {
+      didDocUrl = `https://${parts[0]}/${parts.slice(1).join('/')}/did.json`;
+    }
+  } else {
+    return null;
+  }
+
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 6000);
+    try {
+      const res = await fetch(didDocUrl, {
+        headers: { Accept: 'application/json' },
+        signal: controller.signal,
+      });
+      if (!res.ok) return null;
+      const doc = (await res.json()) as {
+        service?: Array<{ id?: string; type?: string; serviceEndpoint?: string }>;
+      };
+      const svc = doc.service?.find(
+        (s) =>
+          s.id === '#atproto_pds' ||
+          (typeof s.id === 'string' && s.id.endsWith('#atproto_pds')) ||
+          s.type === 'AtprotoPersonalDataServer'
+      );
+      if (!svc?.serviceEndpoint || typeof svc.serviceEndpoint !== 'string') {
+        return null;
+      }
+      const endpoint = svc.serviceEndpoint.replace(/\/+$/, '');
+      pdsEndpointCache.set(did, { endpoint, expiresAt: Date.now() + PDS_CACHE_TTL_MS });
+      return endpoint;
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch {
     return null;
   }
 }

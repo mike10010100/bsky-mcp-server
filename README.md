@@ -17,26 +17,33 @@ You can use this MCP server to bring context from various Bluesky / ATProtocol A
 
 Here's the current list of tools provided:
 
-- **get-pinned-feeds**: returns the set of all "pinned" items from the authenticated user's preferences.
-- **get-timeline-posts**: returns posts from the authenticated user's home timeline
-- **get-feed-posts**: returns posts from the specified feed
-- **get-list-posts**: returns posts from the specified list
-- **get-user-posts**: returns the specified user's posts
+- **get-my-handle-and-did**: returns the handle and DID of the authenticated session
+- **get-pinned-feeds**: returns the set of all "pinned" items from the authenticated user's preferences
+- **get-timeline-posts**: returns posts from the authenticated user's home timeline (`compact` or `full` XML, optional `includeReposts` and `cursor`)
+- **get-feed-posts**: returns posts from the specified custom feed (`compact` or `full` XML)
+- **get-list-posts**: returns posts from the specified list (`compact` or `full` XML)
+- **get-user-posts**: returns a user's posts (`compact` or `full` XML, `includeReposts`, `cursor`, and `source: "appview" | "pds"` for direct PDS record reads)
+- **get-posts**: batch-hydrates up to 25 post AT URIs or `bsky.app` web URLs in one call and flags deleted/not-found targets
+- **get-post-thread**: returns a conversation thread for a specific post URI or web URL (configurable `depth`, `parentHeight`, `maxRepliesPerNode`, and `detail`)
+- **get-post-quotes**: returns posts that quote-post a specific post URI or web URL
+- **get-post-likes**: returns users who liked a specific post URI or web URL
+- **get-notifications**: returns notifications with inline post text, reply/quote pointers, `hours`/`since` time windows, `authorFilter`, and PDS-backed `replyFilter` (`all` / `responded` / `unresponded`)
 - **get-profile**: returns the profile details of the specified user
-- **get-follows**: returns the set of users an account follows
-- **get-followers**: returns the set of users who follow an account
+- **get-follows**: returns users an account follows (PDS-direct fast path for self, `compact` or `full`, `cursor`)
+- **get-followers**: returns users who follow an account (`compact` or `full`, `cursor`)
 - **get-liked-posts**: returns recent posts liked by the authenticated user
 - **get-trends**: returns current trending topics on Bluesky with post counts
-- **get-post-thread**: returns a full conversation thread for a specific post, showing all replies and context
-- **convert-url-to-uri**: converts a Bluesky web URL to an AT URI format that can be used with other tools
-- **search-posts**: returns posts for a given query. can specify top or latest
+- **convert-url-to-uri**: converts a Bluesky web URL to an AT URI format
+- **search-posts**: searches posts with native filters (`since`, `until`, `author`, `mentions`, `domain`, `url`, `tag`, `lang`, `cursor`, `sort`)
 - **search-people**: returns people for a given search query
 - **search-feeds**: returns feeds for a given query
-- **like-post**: like a post with a specific URI
-- **create-post**: publish a post 
-- **delete-post**: delete a post by URI or web URL
-- **follow-user**: follow a specific user
-- **unfollow-user**: unfollow a user by handle/DID or follow record URI
+- **create-post**: publishes a post (enforcing 300-grapheme limits, fail-closed `quoteUri` & `replyTo` resolution, up to 4 images including `recordWithMedia`, and post-flight metadata)
+- **create-thread**: publishes a multi-post thread with atomic pre-flight validation of all posts before post #1 is sent
+- **delete-post**: deletes a post by AT URI or web URL
+- **like-post** / **unlike-post**: likes or unlikes a post by AT URI, web URL, or like record URI
+- **repost** / **unrepost**: reposts or removes a repost by AT URI, web URL, or repost record URI
+- **follow-user** / **unfollow-user**: follows or unfollows a user by handle/DID or follow record URI
+- **list-resources**: lists available MCP resources
 - **list-dm-conversations**: list direct message (DM) conversations with optional unread or request filters
 - **get-dm-messages**: read messages from a DM conversation by `convoId` or participant handle/DID
 - **send-dm**: send or reply to a DM by `convoId` or recipient handle/DID (supports rich text links/mentions/hashtags and post quotes)
