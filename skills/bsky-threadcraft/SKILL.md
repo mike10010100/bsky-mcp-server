@@ -1,6 +1,6 @@
 ---
 name: bsky-threadcraft
-description: Researches, drafts, de-AI-ifies, and red-teams bulletproof Bluesky threads (standalone explainers, quote-posts, and replies) matching Mike Paulauski's authentic voice (@mike10010100.com). Enforces strict <= 300 grapheme limits, live cached WP:AISIGNS checks, evidence-pack handoffs, and adversarial subagent auditing.
+description: Researches, drafts, de-AI-ifies, renders receipt cards, and red-teams bulletproof Bluesky threads (standalone explainers, quote-posts, and replies) matching Mike Paulauski's authentic voice (@mike10010100.com). Enforces strict <= 300 grapheme limits, live cached WP:AISIGNS checks, <1s Retina receipt cards, evidence-pack handoffs, and tiered adversarial auditing.
 ---
 
 # Bluesky Threadcraft
@@ -12,11 +12,11 @@ The goal is **rigor, factual precision, and authentic voice**—never a formulai
 ## Pipeline Overview
 
 ```
-[1. Primary Sources & Evidence Pack] ➡️ [2. Cached Mode-Matched Voice + WP:AISIGNS Prep & Draft] ➡️ [3. Deterministic lint_thread.py Pass] ➡️ [4. Red-Team Subagent Audit (TypeName="self", Zero Cold-Start)] ➡️ [5. User Approval Gate] ➡️ [6. Atomic create-thread Publish]
+[1. Turn-1 Parallel Fetch + Cached Voice/AISIGNS Prep] ➡️ [2. Evidence Pack, Optional <1s Receipt Cards & Draft] ➡️ [3. Deterministic lint_thread.py Pass] ➡️ [4. Tiered Audit: Subagent Red-Team (Default) OR 1-Post In-Thread Fast-Path] ➡️ [5. User Approval Gate] ➡️ [6. Atomic create-thread / create-post Publish]
 ```
 
 > **CRITICAL RULE — NEVER AUTO-POST WITHOUT EXPLICIT USER APPROVAL:**
-> Even if the user initially says *"we should reply"* or *"let's post a thread about X,"* **NEVER** call `create-thread` or `create-post` automatically after Stage 4. Always present the final red-teamed draft (with exact grapheme counts and target `replyTo` / `quoteUri` links) and wait for explicit sign-off (e.g., *"post it"*, *"looks good, send it"*, *"ship it"*) in a subsequent turn.
+> Even if the user initially says *"we should reply"* or *"let's post a thread about X,"* **NEVER** call `create-thread` or `create-post` automatically after Stage 4 (on either full red-team or fast-path). Always present the final audited draft (with exact grapheme counts, rendered card previews if any, and target `replyTo` / `quoteUri` links) and wait for explicit sign-off (e.g., *"post it"*, *"looks good, send it"*, *"ship it"*) in a subsequent turn.
 
 ---
 
@@ -37,39 +37,83 @@ All post/thread tools on `ServerName: "bluesky"` accept **either** AT URIs (`at:
 
 ---
 
-## Stage 1: Primary Source Ingestion, Pronouns & Evidence Pack
+## Stage 1: Turn-1 Parallel Context Fetch, Pronouns & Cached Prep
 
-Before writing a single post:
-1. **Fetch Primary Context:**
-   - Fetch the target post, ancestors, and author follow-ups via `get-post-thread` (`detail: "compact"`, `maxRepliesPerNode: 20`) or `public.api.bsky.app` if blocked.
-   - If a video, roll call, filing, or document is cited, ingest the primary material (`yt-dlp` subtitles/frames, Clerk XML, FEC/Federal Register text) into `$SCRATCH_DIR`.
-2. **Pronoun & Identity Check (Mandatory When Mentioning People):**
-   - Call `get-profile` for every person/account mentioned (checks native `Pronouns:`, `Bio:`, `Labels:`, and `Pinned Post:`). If still unconfirmed, run a targeted `search-posts` (`author: "<handle>"`, query: `pronouns`) or check official bios.
-   - If pronouns cannot be verified with certainty, refer to them strictly by **name/handle** or second-person **`"you"`**—never guess.
+Save an entire round-trip by firing **primary Bluesky context + cached voice/AISIGNS prep in the same Turn-1 tool batch**:
+
+1. **Turn-1 Parallel Tool Batch (Run Simultaneously):**
+   - **Context:** Call `get-post-thread` (`detail: "compact"`, `maxRepliesPerNode: 20`) on the target URL/URI (or `public.api.bsky.app` if blocked).
+   - **Pronouns & Identity:** Call `get-profile` for every known handle in the target post (checks native `Pronouns:`, `Bio:`, `Labels:`, and `Pinned Post:`).
+   - **Cached Voice + Live `WP:AISIGNS` Digest (`< 0.4s` warm):** Run both cached helpers in one parallel `run_command` call right in Turn 1 (use `--mode auto` if mode isn't obvious yet):
+     ```bash
+     SCRATCH_DIR="<artifact_dir>/scratch" && mkdir -p "$SCRATCH_DIR" \
+     && python3 /home/mike10010100/.gemini/config/skills/bsky-threadcraft/scripts/sample_mike_posts.py \
+       --mode <explainer|quote|reply|auto> --output "$SCRATCH_DIR/mike_voice_sample.txt" \
+     && python3 /home/mike10010100/.gemini/config/skills/bsky-threadcraft/scripts/fetch_aisigns_digest.py \
+       --output "$SCRATCH_DIR/wp_aisigns_digest.md"
+     ```
+2. **Follow-Up Primary Sources & Unconfirmed Pronouns (Turn 2 Read Batch):**
+   - Read `$SCRATCH_DIR/mike_voice_sample.txt`, `$SCRATCH_DIR/wp_aisigns_digest.md`, and [references/mike-voice.md](references/mike-voice.md) in a single parallel `read_file` batch alongside any follow-up lookups.
+   - If a video, roll call, filing, or statute is cited, ingest the primary material (`yt-dlp` subtitles/frames, Clerk XML, FEC/Federal Register text) into `$SCRATCH_DIR`.
+   - For any newly discovered person whose pronouns weren't confirmed in Turn 1, call `get-profile` / `search-posts` (`author: "<handle>"`, query: `pronouns`). If pronouns remain unconfirmed, use **name/handle** or **`"you"`** strictly—never guess.
 3. **Lock In Mode, Thesis & Closing Button (Never Draft a Pure Listicle):**
    - Choose mode: `explainer` (standalone breakdown), `quote` (quote-post analysis), or `reply` (direct pushback/addition).
    - **Core Thesis:** Define the single governing argument. If multiple angles are plausible after an open-ended fact-check, clarify the angle with the user first.
    - **Closing Button:** Define where the final post lands (the real-world takeaway, clincher, or why the facts matter). Never stop dead on a stray caveat or shrug.
-4. **Write `$SCRATCH_DIR/evidence_pack.md` (Eliminates Subagent Cold-Start):**
-   - Save a concise structured dossier in `$SCRATCH_DIR/evidence_pack.md` (even when facts came from earlier turns in the same conversation!) listing:
+4. **Write `$SCRATCH_DIR/evidence_pack.md` (Required for Tier A Red-Team; Optional on Tier B 1-Post Fast-Path):**
+   - Whenever Stage 4 uses the full subagent audit (see Stage 4 rules), save a concise dossier in `$SCRATCH_DIR/evidence_pack.md` (even when facts came from earlier turns in the same conversation!) listing:
      - Mode, Core Thesis, Closing Button, and target `replyTo` / `quoteUri` URLs + full OP text (including OP's immediate self-replies).
      - **Pronoun Ledger:** Every referenced person -> verified pronouns + exact source (or `unverified -> name-only`).
      - **Claim-to-Receipt Map:** Every factual claim, number, and timestamp mapped to its URL, cached file path in `$SCRATCH_DIR`, and verbatim quote **including the immediately preceding and succeeding sentences**.
 
 ---
 
-## Stage 2: Fast Cached Prep (`< 1s`) & Authentic Drafting
+## Stage 2: Optional `< 1s` Receipt Cards & Authentic Drafting
 
-1. **One-Shot Parallel Prep Command (Voice Sample + Distilled Live `WP:AISIGNS`):**
-   Run both cached helpers in a single command (reuses local pre-`2026-10-30` corpus cache + live-verified Wikipedia `revid` digest in `< 0.5s`, producing compact `< 18 KB` files that never hit `read_file` byte truncation):
-   ```bash
-   SCRATCH_DIR="<artifact_dir>/scratch" && mkdir -p "$SCRATCH_DIR" \
-   && python3 /home/mike10010100/.gemini/config/skills/bsky-threadcraft/scripts/sample_mike_posts.py \
-     --mode <explainer|quote|reply> --output "$SCRATCH_DIR/mike_voice_sample.txt" \
-   && python3 /home/mike10010100/.gemini/config/skills/bsky-threadcraft/scripts/fetch_aisigns_digest.py \
-     --output "$SCRATCH_DIR/wp_aisigns_digest.md"
-   ```
-   Read `$SCRATCH_DIR/mike_voice_sample.txt`, `$SCRATCH_DIR/wp_aisigns_digest.md`, and [references/mike-voice.md](references/mike-voice.md) in a single parallel `read_file` batch.
+1. **Deterministic Receipt Cards (`render_receipt_card.py` — Never Hand-Roll HTML/Browser Scripts):**
+   When visual receipts strengthen a thread (statutory/EO/filing excerpts, roll-call tallies, or archived post chains), render tightly auto-cropped `2x` Retina PNGs + accessible `imageAlts` in `< 1s` via `render_receipt_card.py`—**never probe browsers or write custom HTML/Playwright scripts**:
+   - **Inline Markup (HTML-escaped safely first):** Wrap verbatim highlights in `==yellow==`, `==green:emerald==`, `==red:crimson==`, `==blue:sky==`, and bold in `**bold**`.
+   - **Batch JSON Spec (`document` & `post` card types):**
+     ```json
+     {
+       "cards": [
+         {
+           "type": "document",
+           "output": "card1.png",
+           "theme": "emerald",
+           "eyebrow": "Executive Order 14141 • 90 FR 5469",
+           "title": "100% New Clean Power Matching Mandate",
+           "subtitle": "Hourly-Matched Generation Requirement",
+           "badge": "Jan 14, 2025",
+           "stats": [{ "label": "Clean Match", "value": "100%", "note": "Hourly deliverable" }],
+           "boxes": [
+             { "label": "Section 2(c) • Policy Mandate", "quote": "AI infrastructure ==green:must be matched with new, clean electricity generation==." }
+           ],
+           "footer_left": "Source: Federal Register Vol. 90, p. 5470",
+           "footer_right": "Verbatim Excerpt (1 of 2)"
+         },
+         {
+           "type": "post",
+           "output": "card2.png",
+           "theme": "blue",
+           "surface": "light",
+           "eyebrow": "In-Thread Walkback Receipt",
+           "title": "Author's Immediate Follow-Up",
+           "badge": "Bluesky",
+           "posts": [
+             { "name": "Jane Doe", "handle": "@janedoe.bsky.social", "date": "Nov 10, 2026 • 2:14 PM", "text": "Verbatim ==highlighted post== text.", "note": "Optional context note" }
+           ],
+           "footer_left": "Archived Nov 10, 2026"
+         }
+       ]
+     }
+     ```
+     Run once and inspect every output PNG visually via `read_file`:
+     ```bash
+     python3 /home/mike10010100/.gemini/config/skills/bsky-threadcraft/scripts/render_receipt_card.py \
+       "$SCRATCH_DIR/cards_spec.json" --out-dir "$SCRATCH_DIR" --manifest "$SCRATCH_DIR/cards_manifest.json"
+     ```
+     *(For a quick 1-card excerpt, pass flags directly: `--type document --theme crimson --eyebrow "..." --title "..." --badge "..." --section "..." --quote "..." --footer-left "..." -o "$SCRATCH_DIR/card1.png"`.)*
 
 2. **Drafting Rules (`Hook ➡️ Receipts ➡️ Button`):**
    - **Match Mode to Context:** Open naturally for an `explainer`, `quote`, or `reply`. Never copy one-off openers (like `"TBF,"`) from a single sampled post or force a canned `"concession -> trapdoor"` formula.
@@ -79,7 +123,7 @@ Before writing a single post:
    - **Hard Mechanical Constraints:**
      - **Zero Em Dashes (`—` or `--`):** Use commas, colons, parentheses, or periods.
      - **Zero Emojis (including `🧵`):** Never include unless explicitly requested.
-     - **Strict Limit:** Every post MUST be **`<= 300` graphemes** (and `<= 3000` UTF-8 bytes), with descriptive `imageAlts` for every attached image.
+     - **Strict Limit:** Every post MUST be **`<= 300` graphemes** (and `<= 3000` UTF-8 bytes), with descriptive `imageAlts` for every attached image (use the manifest's `imagePaths` + `imageAlts`).
 
 ---
 
@@ -109,26 +153,39 @@ Fix all `[ERROR]` items and any non-verbatim `[WARN]` AI-ism flags (triads, nega
 
 ---
 
-## Stage 4: Subagent Red-Team Audit (`TypeName: "self"`, Zero Cold-Start)
+## Stage 4: Tiered Red-Team Audit Gate
 
-Invoke an adversarial subagent via `invoke_subagent` with **`TypeName: "self"`** (never `research`, which lacks network/MCP access for live verification) and `Role: "Red Team Critic & Voice Auditor"`, passing the paths to `$SCRATCH_DIR/draft.json`, `$SCRATCH_DIR/evidence_pack.md`, `$SCRATCH_DIR/mike_voice_sample.txt`, `$SCRATCH_DIR/wp_aisigns_digest.md`, and [references/red-team-rubric.md](references/red-team-rubric.md):
+Choose the tier strictly by structural risk—**when in doubt, always run Tier A**:
 
+### Tier A — Full Subagent Red-Team (`TypeName: "self"`, Mandatory Default)
+**Required whenever ANY of these hold:**
+- Multi-post thread (`2+` posts), standalone `explainer`, or `quote` breakdown
+- Any attached image or receipt card (`imagePaths` non-empty)
+- Any external factual claim, roll-call tally, statute/EO/FEC filing, dollar/percentage math, or transcript/video timestamp
+
+Invoke `invoke_subagent` with **`TypeName: "self"`** and **`Model: "inherit"`** (never `research`, which lacks network/MCP access, and never downgrade model quality) and `Role: "Red Team Critic & Voice Auditor"`, passing `$SCRATCH_DIR/draft.json`, `$SCRATCH_DIR/evidence_pack.md`, `$SCRATCH_DIR/mike_voice_sample.txt`, `$SCRATCH_DIR/wp_aisigns_digest.md`, and [references/red-team-rubric.md](references/red-team-rubric.md):
 - **Strict Read-Only External Boundary:** The subagent MUST **never** call `create-post`, `create-thread`, `delete-post`, or edit repository files—only read sources, run targeted verification queries, and write `$SCRATCH_DIR/draft_redteamed.json`.
-- **Zero Cold-Start Re-Googling:** The subagent starts from `$SCRATCH_DIR/evidence_pack.md` and cached files in `$SCRATCH_DIR`. Do **not** re-search baseline facts already proven in local primary files; spend 100% of external queries trying to **break** the draft (checking adjacent roll calls, footnotes, OP follow-ups, rival definitions, visual accuracy, and pedant/troll escape hatches).
-- **Proportional Depth:** Keep external checks surgical (~1–4 targeted lookups) on 1–2 post replies whose receipts are already cached locally; run deeper verification sweeps on complex multi-post explainers.
-- **Single-Owner Structural Rewrite & Lint:** If the audit uncovers factual traps, an unbuttoned ending, or a stronger narrative arc, **rewrite from scratch** rather than patching clunky edits into old post boundaries, save `$SCRATCH_DIR/draft_redteamed.json`, and run `lint_thread.py` once to confirm `0` hard errors before returning.
+- **Zero Cold-Start Re-Googling:** Start from `$SCRATCH_DIR/evidence_pack.md` and cached `$SCRATCH_DIR` files; spend 100% of external queries trying to **break** the draft (adjacent roll calls, footnotes, OP follow-ups, rival definitions, visual card accuracy, pedant escape hatches).
+- **Single-Owner Structural Rewrite & Lint:** If the audit uncovers factual traps, an unbuttoned ending, or a stronger narrative arc, **rewrite from scratch** rather than patching clunky edits into old post splits, save `$SCRATCH_DIR/draft_redteamed.json`, and run `lint_thread.py` once to confirm `0` hard errors before returning.
+
+### Tier B — 1-Post In-Thread Reply Fast-Path (Inline Rubric + `lint_thread.py`)
+**Permitted ONLY when ALL 4 conditions hold:**
+1. Single-post (`1`-post) direct reply (`mode == "reply"`)
+2. Zero attached images/cards (`imagePaths` empty)
+3. References **only** already-fetched in-thread context (`get-post-thread` + verified `get-profile` pronouns) with **zero** new external stats, filings, roll calls, timestamps, or math
+4. You walk through all 4 Audit Areas in [references/red-team-rubric.md](references/red-team-rubric.md) inline (OP follow-up/walkback check, pronoun check, pedant dunk simulation, voice + `WP:AISIGNS` check) and confirm `lint_thread.py --mode reply "$SCRATCH_DIR/draft.json"` passes with `0` hard errors.
 
 ---
 
 ## Stage 5: Mandatory User Approval Gate
 
-1. **STOP** immediately after Stage 4 completes.
-2. Present the final hardened thread copy, exact grapheme counts (`N/300`), attached images/alts, and target `replyTo` / `quoteUri` links.
+1. **STOP** immediately after Stage 4 completes (both Tier A and Tier B).
+2. Present the final hardened copy, exact grapheme counts (`N/300`), attached receipt cards/alts (if any), and target `replyTo` / `quoteUri` links.
 3. **Wait for explicit user sign-off** before publishing anything.
 
 ---
 
-## Stage 6: One-Call Verified Thread Publishing (Only After Approval)
+## Stage 6: One-Call Verified Publishing (Only After Approval)
 
 Once the user approves:
 - **Multi-post thread:** Publish in **one single tool call** via `create-thread` (`ServerName: "bluesky"`, `ToolName: "create-thread"`), passing `posts` and optional `replyTo` directly from the approved JSON.
