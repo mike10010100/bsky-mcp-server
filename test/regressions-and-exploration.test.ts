@@ -845,6 +845,197 @@ async function runSystematicPropertyExploration() {
   );
 }
 
+async function testRegressionR7ProfilePronounsAndPostFlightRollback() {
+  const storedRecords = new Map<string, any>();
+  const deletedUris: string[] = [];
+  let postCounter = 0;
+  let corruptRecordOnIndex: number | null = null;
+  let throwPublishOnIndex: number | null = null;
+
+  const fakeAgent: any = {
+    did: "did:plc:mike",
+    getProfile: async ({ actor }: { actor: string }) => {
+      if (actor === "with-pronouns.test") {
+        return {
+          success: true,
+          data: {
+            did: "did:plc:pronouns1",
+            handle: "with-pronouns.test",
+            displayName: "Pronoun User",
+            pronouns: "she/they",
+            description: "Policy researcher",
+            followersCount: 120,
+            followsCount: 80,
+            postsCount: 450,
+            pinnedPost: { uri: "at://did:plc:pronouns1/app.bsky.feed.post/3kpinned", cid: "cid-pin" },
+            labels: [{ val: "verified" }],
+          },
+        };
+      }
+      return {
+        success: true,
+        data: {
+          did: "did:plc:plain",
+          handle: "plain.test",
+          followersCount: 5,
+          followsCount: 2,
+          postsCount: 1,
+        },
+      };
+    },
+    app: {
+      bsky: {
+        feed: {
+          getPosts: async ({ uris }: { uris: string[] }) => ({
+            success: true,
+            data: {
+              posts: uris
+                .filter((u) => u === "at://did:plc:target/app.bsky.feed.post/root0" || u === "at://did:plc:quote/app.bsky.feed.post/q1")
+                .map((u) => makePostView({ uri: u, cid: `cid-${u.split("/").pop()}`, text: "Target" })),
+            },
+          }),
+        },
+      },
+    },
+    post: async (record: any) => {
+      postCounter += 1;
+      if (throwPublishOnIndex !== null && postCounter === throwPublishOnIndex) {
+        throw new Error("Simulated PDS network timeout");
+      }
+      const rkey = `rkey_${postCounter}`;
+      const uri = `at://did:plc:mike/app.bsky.feed.post/${rkey}`;
+      // Optionally corrupt the stored record to test post-flight detection & rollback
+      const saved =
+        corruptRecordOnIndex !== null && postCounter === corruptRecordOnIndex
+          ? { ...record, reply: undefined }
+          : record;
+      storedRecords.set(uri, saved);
+      return { uri, cid: `cid_${postCounter}` };
+    },
+    deletePost: async (uri: string) => {
+      deletedUris.push(uri);
+      storedRecords.delete(uri);
+    },
+    com: {
+      atproto: {
+        repo: {
+          getRecord: async ({ repo, collection, rkey }: { repo: string; collection: string; rkey: string }) => {
+            const uri = `at://${repo}/${collection}/${rkey}`;
+            const val = storedRecords.get(uri);
+            return { success: true, data: { uri, cid: "cid-rec", value: val } };
+          },
+        },
+      },
+    },
+  };
+
+  const { client, close } = await harness(() => fakeAgent as Agent);
+  try {
+    // 1. get-profile surfaces native Pronouns + Pinned Post when present
+    const prof1: any = await client.callTool({ name: "get-profile", arguments: { handle: "with-pronouns.test" } });
+    assert.equal(prof1.isError, undefined);
+    const p1Text = prof1.content[0].text as string;
+    assert.match(p1Text, /Pronouns: she\/they/);
+    assert.match(p1Text, /Pinned Post: at:\/\/did:plc:pronouns1\/app\.bsky\.feed\.post\/3kpinned/);
+    assert.match(p1Text, /Labels: verified/);
+
+    // 2. get-profile omits Pronouns / Pinned Post cleanly without double-newline gaps when absent
+    const prof2: any = await client.callTool({ name: "get-profile", arguments: { handle: "plain.test" } });
+    assert.equal(prof2.isError, undefined);
+    const p2Text = prof2.content[0].text as string;
+    assert.ok(!p2Text.includes("Pronouns:"));
+    assert.ok(!p2Text.includes("Pinned Post:"));
+    assert.ok(!p2Text.includes("\n\n"));
+
+    // 3. create-thread happy path verifies all PDS records (reply chain + quote embed)
+    postCounter = 0;
+    storedRecords.clear();
+    deletedUris.length = 0;
+    const okThread: any = await client.callTool({
+      name: "create-thread",
+      arguments: {
+        replyTo: "at://did:plc:target/app.bsky.feed.post/root0",
+        posts: [
+          { text: "Post 1 opening hook", quoteUri: "at://did:plc:quote/app.bsky.feed.post/q1", embedPreview: false },
+          { text: "Post 2 receipt body", embedPreview: false },
+          { text: "Post 3 closing button", embedPreview: false },
+        ],
+      },
+    });
+    assert.equal(okThread.isError, undefined);
+    assert.match(okThread.content[0].text, /Post-Flight: PASS \(3\/3 PDS records verified\)/);
+    assert.equal(storedRecords.size, 3);
+
+    // 4. create-thread post-flight mismatch on Post #3 rolls back #3 -> #2 -> #1 in reverse order
+    postCounter = 0;
+    storedRecords.clear();
+    deletedUris.length = 0;
+    corruptRecordOnIndex = 3;
+    const mismatchThread: any = await client.callTool({
+      name: "create-thread",
+      arguments: {
+        replyTo: "at://did:plc:target/app.bsky.feed.post/root0",
+        posts: [
+          { text: "Post 1", embedPreview: false },
+          { text: "Post 2", embedPreview: false },
+          { text: "Post 3 with corrupted reply", embedPreview: false },
+        ],
+      },
+    });
+    corruptRecordOnIndex = null;
+    assert.equal(mismatchThread.isError, true);
+    assert.match(mismatchThread.content[0].text, /Post-flight reply mismatch/);
+    assert.match(mismatchThread.content[0].text, /Rolled back all 3 published post\(s\) cleanly/);
+    assert.deepEqual(deletedUris, [
+      "at://did:plc:mike/app.bsky.feed.post/rkey_3",
+      "at://did:plc:mike/app.bsky.feed.post/rkey_2",
+      "at://did:plc:mike/app.bsky.feed.post/rkey_1",
+    ]);
+    assert.equal(storedRecords.size, 0);
+
+    // 5. create-thread with rollbackOnFailure=false preserves already-published posts and lists them
+    postCounter = 0;
+    storedRecords.clear();
+    deletedUris.length = 0;
+    throwPublishOnIndex = 2;
+    const noRollback: any = await client.callTool({
+      name: "create-thread",
+      arguments: {
+        rollbackOnFailure: false,
+        posts: [
+          { text: "Standalone Post 1", embedPreview: false },
+          { text: "Standalone Post 2 fails", embedPreview: false },
+        ],
+      },
+    });
+    throwPublishOnIndex = null;
+    assert.equal(noRollback.isError, true);
+    assert.match(noRollback.content[0].text, /Already published \(1\)/);
+    assert.equal(deletedUris.length, 0);
+    assert.equal(storedRecords.size, 1);
+
+    // 6. create-post single-post post-flight mismatch deletes the malformed post automatically
+    postCounter = 0;
+    storedRecords.clear();
+    deletedUris.length = 0;
+    corruptRecordOnIndex = 1;
+    const badSingle: any = await client.callTool({
+      name: "create-post",
+      arguments: {
+        text: "Reply whose reply ref gets dropped",
+        replyTo: "at://did:plc:target/app.bsky.feed.post/root0",
+        embedPreview: false,
+      },
+    });
+    corruptRecordOnIndex = null;
+    assert.equal(badSingle.isError, true);
+    assert.match(badSingle.content[0].text, /deleted malformed post at:\/\/did:plc:mike\/app\.bsky\.feed\.post\/rkey_1/);
+    assert.equal(storedRecords.size, 0);
+  } finally {
+    await close();
+  }
+}
+
 async function main() {
   const suites: Array<[string, () => Promise<void>]> = [
     ["R1: deep orphaned replies & multi-sibling nested XML slice regression", testRegressionR1DeepOrphanedRepliesAndMultiSiblingXml],
@@ -853,6 +1044,7 @@ async function main() {
     ["R4: repost of old post does not prematurely abort hours-window pagination", testRegressionR4OldRepostDoesNotAbortHoursPagination],
     ["R5: create-post & create-thread grapheme count, fail-closed quoteUri, and atomic pre-flight", testRegressionR5CreatePostAndCreateThreadContracts],
     ["R6: did:web:, did:plc: web URLs, and like/unlike/repost/unrepost validation", testRegressionR6LikeUnlikeRepostUnrepostAndUrlVariants],
+    ["R7: get-profile pronouns/pinnedPost & create-post/create-thread PDS post-flight verification and rollback", testRegressionR7ProfilePronounsAndPostFlightRollback],
     ["Systematic seeded exploration (150 feed graphs + 80 thread trees + XML oracle)", runSystematicPropertyExploration],
   ];
 

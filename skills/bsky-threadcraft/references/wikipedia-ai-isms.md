@@ -1,30 +1,31 @@
 # Wikipedia AI-isms & LLM Tells Audit (`WP:AISIGNS`)
 
-Based on the community-maintained English Wikipedia guide `Wikipedia:Signs of AI writing` (`WP:AISIGNS`) and automated cleanup heuristics. Every draft post must be audited against these categories before submission.
+> **LIVE REVISION-CACHED DIGEST (`fetch_aisigns_digest.py`):**
+> Do **not** dump the raw 180 KB MediaWiki wikitext (which triggers multi-turn byte truncations and fills context with `<ref>` and AfC noise). Always run `fetch_aisigns_digest.py`, which verifies Wikipedia's live `revid` for `Wikipedia:Signs_of_AI_writing`, updates `~/.cache/bsky-threadcraft/wp_aisigns_cache.json` whenever the page changes, and writes a clean `< 18 KB` prose digest (`wp_aisigns_digest.md`) plus machine-readable rules (`wp_aisigns_rules.json`) consumed automatically by `lint_thread.py`:
+> ```bash
+> python3 /home/mike10010100/.gemini/config/skills/bsky-threadcraft/scripts/fetch_aisigns_digest.py \
+>   --output "$SCRATCH_DIR/wp_aisigns_digest.md"
+> ```
+
+Read `$SCRATCH_DIR/wp_aisigns_digest.md` alongside these core categories and run `lint_thread.py` on `$SCRATCH_DIR/draft.json`:
 
 ## 1. Punctuation & Typography
-- **The Em Dash (`—`):** Historically the single biggest tell of LLM generation. Models use em dashes compulsively to create dramatic pauses or punchy asides where humans use commas, parentheses, colons, or periods. **Strict rule: Zero em dashes.**
-- **Curled Smart Quotes or Stray Markdown Glitches:** Ensure clean standard quotes and backticks.
+- **Zero Em Dashes (`—` or `--`):** LLMs use em dashes compulsively for dramatic pivots. Use commas, parentheses, colons, or periods.
+- **Clean Typography:** Zero emojis unless requested; keep quotes and punctuation clean.
 
 ## 2. Structural & Rhetorical Tells
-- **The Rule of Three (Compulsive Triads):** LLMs love grouping items, benefits, or adjectives into triads (*"innovative, transformative, and groundbreaking"*, *"housing, healthcare, and labor dignity"*). Break them up into pairs or singular direct points.
-- **Negative Parallelisms:** Contrast formulas like:
-  - *"It's not just X, it's Y"*
-  - *"Not X, but rather Y"*
-  - *"That's not about X; it's about Y"*
-  Models rely on this heavily for synthetic gravitas. State the point directly instead of using the negation setup.
-- **Formulaic Concession-Then-Pivot Transitions:**
-  - AI essay pattern: *"While X is certainly true... nevertheless, Y remains crucial."*
-  - Avoid chaining textbook transition markers across consecutive posts: *"First... Second... Third..."* or *"Meanwhile... Furthermore... Consequently..."*.
-- **Superficial "-ing" Analytical Clauses:**
-  Tacking participial phrases onto the end of sentences (*"...highlighting the importance of..."*, *"...underscoring the divide..."*, *"...fostering a sense of community..."*). Cut the tail; end on the factual assertion.
+- **Compulsive Triads ("Rule of Three"):** Break automatic 3-item rhetorical groupings (*"speed, scale, and efficiency"*, *"housing, healthcare, and labor"*) into direct singular points or pairs (purely factual enumerations of 3 named bills/votes are fine when warranted).
+- **Negative Parallelisms:** Purge contrast formulas used for synthetic gravitas:
+  - *"It's not just X, it's Y"* / *"Not only X, but also Y"*
+  - *"Not X, but rather Y"* / *"That's not about X; it's about Y"*
+  - *"No X, no Y, just Z"*
+  State what the thing actually is directly.
+- **Copulative Avoidance:** Don't replace simple *"is" / "are" / "has"* with inflated verbs (*"serves as"*, *"stands as"*, *"functions as"*, *"boasts"*, *"holds the distinction of"*).
+- **Superficial `-ing` Analytical Tails:** Cut trailing participial commentary (*"...highlighting the divide"*, *"...underscoring the stakes"*, *"...fostering accountability"*). End on the concrete fact.
+- **Mechanical Essay Signposting:** Avoid *"First... Second... Third..."*, *"Furthermore,"*, *"Moreover,"*, or *"Ultimately,"*.
 
-## 3. High-Frequency AI Vocabulary (Purge on Sight)
-Do not use these words or their variations:
+## 3. High-Frequency AI Vocabulary (Auto-Checked via `wp_aisigns_rules.json`)
+Purge unless inside a verbatim quote:
 - **Verbs:** *delve, underscore, showcase, highlight, bolster, foster, garner, exemplify, align with, intertwine*
-- **Adjectives & Adverbs:** *pivotal, crucial, vital, paramount, fundamental, meticulous, multifaceted, vibrant, nuanced, enduring, stark*
-- **Nouns:** *tapestry, landscape, interplay, testament, beacon, crux, plethora*
-- **Formulas:** *"stands as a testament"*, *"serves as a reminder"*, *"in today's fast-paced world"*, *"plays a key role"*
-
-## 4. Live Verification Command
-When auditing, the agent can run a quick search or Python regex check to verify zero occurrences of em dashes, negative parallelisms, or banned stems.
+- **Adjectives/Adverbs:** *pivotal, crucial, paramount, multifaceted, meticulous, vibrant, nuanced, enduring, stark, Additionally (sentence-initial)*
+- **Nouns/Formulas:** *tapestry, landscape (figurative), interplay, testament, beacon, crux, plethora, "stands as a testament", "serves as a reminder"*

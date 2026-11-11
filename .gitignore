@@ -58,4 +58,8 @@ sessions/
 # Cursor stuff
 .cursorrules
 
+# Python bytecode
+__pycache__/
+*.py[cod]
+
 POST_FORMAT_SPEC.md

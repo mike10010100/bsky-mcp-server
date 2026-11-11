@@ -28,7 +28,7 @@ Here's the current list of tools provided:
 - **get-post-quotes**: returns posts that quote-post a specific post URI or web URL
 - **get-post-likes**: returns users who liked a specific post URI or web URL
 - **get-notifications**: returns notifications with inline post text, reply/quote pointers, `hours`/`since` time windows, `authorFilter`, and PDS-backed `replyFilter` (`all` / `responded` / `unresponded`)
-- **get-profile**: returns the profile details of the specified user
+- **get-profile**: returns the profile details of the specified user (including native `pronouns`, `pinnedPost`, bio, counts, and moderation labels)
 - **get-follows**: returns users an account follows (PDS-direct fast path for self, `compact` or `full`, `cursor`)
 - **get-followers**: returns users who follow an account (`compact` or `full`, `cursor`)
 - **get-liked-posts**: returns recent posts liked by the authenticated user
@@ -37,8 +37,8 @@ Here's the current list of tools provided:
 - **search-posts**: searches posts with native filters (`since`, `until`, `author`, `mentions`, `domain`, `url`, `tag`, `lang`, `cursor`, `sort`)
 - **search-people**: returns people for a given search query
 - **search-feeds**: returns feeds for a given query
-- **create-post**: publishes a post (enforcing 300-grapheme limits, fail-closed `quoteUri` & `replyTo` resolution, up to 4 images including `recordWithMedia`, and post-flight metadata)
-- **create-thread**: publishes a multi-post thread with atomic pre-flight validation of all posts before post #1 is sent
+- **create-post**: publishes a post (enforcing 300-grapheme limits, fail-closed `quoteUri` & `replyTo` resolution, up to 4 images including `recordWithMedia`, PDS post-flight record verification, and automatic rollback on mismatch)
+- **create-thread**: publishes a multi-post thread with atomic pre-flight validation of all posts before post #1 is sent, PDS post-flight record verification, and reverse-order rollback on mid-thread failure
 - **delete-post**: deletes a post by AT URI or web URL
 - **like-post** / **unlike-post**: likes or unlikes a post by AT URI, web URL, or like record URI
 - **repost** / **unrepost**: reposts or removes a repost by AT URI, web URL, or repost record URI
