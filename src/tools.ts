@@ -274,6 +274,82 @@ async function publishPreparedPostDraft(
   };
 }
 
+/**
+ * Post-flight verification of a newly published post record directly against the author's PDS
+ * (`com.atproto.repo.getRecord`) to ensure reply linkage and quote/media embeds match expectations.
+ * Gracefully skips if `com.atproto.repo.getRecord` is not available (e.g. lightweight unit test stubs).
+ */
+async function verifyPublishedPostRecord(
+  agent: Agent,
+  uri: string,
+  draft: PreparedPostDraft,
+  replyRefs?: { parent: { uri: string; cid: string }; root: { uri: string; cid: string } }
+): Promise<{ verified: boolean; detail: string }> {
+  const getRecordFn = (agent as any)?.com?.atproto?.repo?.getRecord;
+  if (typeof getRecordFn !== 'function') {
+    return { verified: false, detail: 'skipped (getRecord unavailable)' };
+  }
+
+  const parts = uri.replace(/^at:\/\//, '').split('/');
+  const [repo, collection, rkey] = parts;
+  if (!repo || !collection || !rkey) {
+    throw new Error(`Post-flight check failed: malformed published URI "${uri}"`);
+  }
+
+  const res = await getRecordFn.call((agent as any).com.atproto.repo, {
+    repo,
+    collection,
+    rkey,
+  });
+  const val = res?.data?.value as any;
+  if (!val || typeof val !== 'object') {
+    throw new Error(`Post-flight check failed: empty record value returned for ${uri}`);
+  }
+
+  if (replyRefs) {
+    const actualParent = val.reply?.parent?.uri;
+    const actualRoot = val.reply?.root?.uri;
+    if (actualParent !== replyRefs.parent.uri || actualRoot !== replyRefs.root.uri) {
+      throw new Error(
+        `Post-flight reply mismatch on ${uri}: expected parent=${replyRefs.parent.uri} root=${replyRefs.root.uri}, got parent=${actualParent ?? 'none'} root=${actualRoot ?? 'none'}`
+      );
+    }
+  } else if (val.reply) {
+    throw new Error(`Post-flight reply mismatch on ${uri}: expected standalone post, but record.reply is set`);
+  }
+
+  const actualEmbedType = val.embed?.$type;
+  if (draft.resolvedQuoteUri && draft.imagePaths.length > 0) {
+    const actualQuote = val.embed?.record?.record?.uri;
+    const actualImages = val.embed?.media?.images?.length ?? 0;
+    if (
+      actualEmbedType !== 'app.bsky.embed.recordWithMedia' ||
+      actualQuote !== draft.resolvedQuoteUri ||
+      actualImages !== draft.imagePaths.length
+    ) {
+      throw new Error(
+        `Post-flight embed mismatch on ${uri}: expected recordWithMedia(quote=${draft.resolvedQuoteUri}, images=${draft.imagePaths.length}), got type=${actualEmbedType ?? 'none'} quote=${actualQuote ?? 'none'} images=${actualImages}`
+      );
+    }
+  } else if (draft.resolvedQuoteUri) {
+    const actualQuote = val.embed?.record?.uri;
+    if (actualEmbedType !== 'app.bsky.embed.record' || actualQuote !== draft.resolvedQuoteUri) {
+      throw new Error(
+        `Post-flight embed mismatch on ${uri}: expected record(quote=${draft.resolvedQuoteUri}), got type=${actualEmbedType ?? 'none'} quote=${actualQuote ?? 'none'}`
+      );
+    }
+  } else if (draft.imagePaths.length > 0) {
+    const actualImages = val.embed?.images?.length ?? 0;
+    if (actualEmbedType !== 'app.bsky.embed.images' || actualImages !== draft.imagePaths.length) {
+      throw new Error(
+        `Post-flight embed mismatch on ${uri}: expected images(${draft.imagePaths.length}), got type=${actualEmbedType ?? 'none'} images=${actualImages}`
+      );
+    }
+  }
+
+  return { verified: true, detail: 'PDS record verified' };
+}
+
 function getMimeType(filePath: string): string {
   const ext = path.extname(filePath).toLowerCase();
   switch (ext) {
@@ -1045,6 +1121,25 @@ export function registerTools(server: any, getAgent: AgentProvider): void {
         }
 
         const published = await publishPreparedPostDraft(agent, prepared.draft, replyRefs);
+        let verificationDetail = 'skipped';
+        try {
+          const check = await verifyPublishedPostRecord(agent, published.uri, prepared.draft, replyRefs);
+          verificationDetail = check.detail;
+        } catch (verifyErr) {
+          let rollbackStatus = 'rollback unavailable';
+          if (typeof (agent as any).deletePost === 'function') {
+            try {
+              await agent.deletePost(published.uri);
+              rollbackStatus = `deleted malformed post ${published.uri}`;
+            } catch (delErr) {
+              rollbackStatus = `failed to delete ${published.uri}: ${delErr instanceof Error ? delErr.message : String(delErr)}`;
+            }
+          }
+          return mcpErrorResponse(
+            `${verifyErr instanceof Error ? verifyErr.message : String(verifyErr)} (${rollbackStatus})`
+          );
+        }
+
         const rkey = published.uri.split('/').pop();
         const actor = agent.did || published.uri.split('/')[2];
         const webUrl = `https://bsky.app/profile/${actor}/post/${rkey}`;
@@ -1056,6 +1151,7 @@ export function registerTools(server: any, getAgent: AgentProvider): void {
           `URL: ${webUrl}`,
           `Graphemes: ${prepared.draft.graphemeLength}/300`,
           `Embed: ${published.embedSummary}`,
+          `Post-Flight: ${verificationDetail}`,
         ];
         if (replyRefs) {
           lines.push(`Reply Parent: ${replyRefs.parent.uri}`);
@@ -1071,7 +1167,7 @@ export function registerTools(server: any, getAgent: AgentProvider): void {
 
   registerTool(
     "create-thread",
-    "Publish a multi-post Bluesky thread with pre-flight validation. Validates EVERY post's 300-grapheme limit, image file paths (<= 4 per post), and quoteUri targets BEFORE publishing post #1 so a bad post never leaves a half-published thread.",
+    "Publish a multi-post Bluesky thread with atomic pre-flight validation, post-flight PDS record verification (reply parent/root & embeds), and automatic rollback on failure. Validates EVERY post's 300-grapheme limit, image file paths (<= 4 per post), and quoteUri targets BEFORE publishing post #1.",
     {
       posts: z.array(
         z.object({
@@ -1084,8 +1180,9 @@ export function registerTools(server: any, getAgent: AgentProvider): void {
         })
       ).min(1).max(50).describe("Ordered array of posts in the thread (post #1 is the root unless replyTo is provided)"),
       replyTo: z.string().optional().describe("Optional AT URI or web URL of an existing post to attach this thread under as a reply chain"),
+      rollbackOnFailure: z.boolean().optional().default(true).describe("If publishing or post-flight verification fails mid-thread, automatically delete already-published posts from this call in reverse order. Defaults to true."),
     },
-    async ({ posts, replyTo }) => {
+    async ({ posts, replyTo, rollbackOnFailure = true }) => {
       const agent = getAgent();
       if (!agent) {
         return mcpErrorResponse("Not connected to Bluesky. Check your environment variables.");
@@ -1119,7 +1216,7 @@ export function registerTools(server: any, getAgent: AgentProvider): void {
           preparedDrafts.push(res.draft);
         }
 
-        // Phase 2: Sequential chained publishing
+        // Phase 2: Sequential chained publishing + PDS post-flight verification
         const publishedItems: Array<{
           index: number;
           uri: string;
@@ -1127,6 +1224,7 @@ export function registerTools(server: any, getAgent: AgentProvider): void {
           url: string;
           graphemes: number;
           embedSummary: string;
+          verified: boolean;
         }> = [];
 
         for (let i = 0; i < preparedDrafts.length; i++) {
@@ -1138,33 +1236,67 @@ export function registerTools(server: any, getAgent: AgentProvider): void {
 
           try {
             const pub = await publishPreparedPostDraft(agent, draft, replyRefs);
-            if (!initialRoot) {
-              initialRoot = { uri: pub.uri, cid: pub.cid };
-            }
-            currentParent = { uri: pub.uri, cid: pub.cid };
-
             const rkey = pub.uri.split('/').pop();
             const actor = agent.did || pub.uri.split('/')[2];
-            publishedItems.push({
+            const item = {
               index: i + 1,
               uri: pub.uri,
               cid: pub.cid,
               url: `https://bsky.app/profile/${actor}/post/${rkey}`,
               graphemes: draft.graphemeLength,
               embedSummary: pub.embedSummary,
-            });
+              verified: false,
+            };
+            // Record immediately so rollback cleans it up if post-flight verification throws
+            publishedItems.push(item);
+
+            const check = await verifyPublishedPostRecord(agent, pub.uri, draft, replyRefs);
+            item.verified = check.verified;
+
+            if (!initialRoot) {
+              initialRoot = { uri: pub.uri, cid: pub.cid };
+            }
+            currentParent = { uri: pub.uri, cid: pub.cid };
           } catch (stepErr) {
+            const errMsg = stepErr instanceof Error ? stepErr.message : String(stepErr);
+            if (rollbackOnFailure && publishedItems.length > 0 && typeof (agent as any).deletePost === 'function') {
+              const deletedUris: string[] = [];
+              const failedDeletes: string[] = [];
+              for (let j = publishedItems.length - 1; j >= 0; j--) {
+                const targetUri = publishedItems[j].uri;
+                try {
+                  await agent.deletePost(targetUri);
+                  deletedUris.push(targetUri);
+                } catch (delErr) {
+                  failedDeletes.push(`${targetUri} (${delErr instanceof Error ? delErr.message : String(delErr)})`);
+                }
+              }
+              const rollbackSummary =
+                failedDeletes.length === 0
+                  ? `Rolled back all ${deletedUris.length} published post(s) cleanly.`
+                  : `Rolled back ${deletedUris.length} post(s); failed to delete: ${failedDeletes.join(', ')}`;
+              return mcpErrorResponse(
+                `Error at Post #${i + 1} of ${preparedDrafts.length}: ${errMsg}\n${rollbackSummary}`
+              );
+            }
+
             const partialList = publishedItems
               .map((p) => `  #${p.index}: ${p.uri} (${p.url})`)
               .join('\n');
             return mcpErrorResponse(
-              `Error publishing Post #${i + 1} of ${preparedDrafts.length}: ${stepErr instanceof Error ? stepErr.message : String(stepErr)}\n` +
+              `Error publishing Post #${i + 1} of ${preparedDrafts.length}: ${errMsg}\n` +
                 (publishedItems.length > 0
                   ? `Already published (${publishedItems.length}):\n${partialList}`
                   : `No posts were published.`)
             );
           }
         }
+
+        const verifiedCount = publishedItems.filter((p) => p.verified).length;
+        const verifySummary =
+          verifiedCount === publishedItems.length
+            ? `PASS (${verifiedCount}/${publishedItems.length} PDS records verified)`
+            : `skipped (getRecord unavailable)`;
 
         const manifest = publishedItems
           .map(
@@ -1174,7 +1306,7 @@ export function registerTools(server: any, getAgent: AgentProvider): void {
           .join('\n');
 
         return mcpSuccessResponse(
-          `Thread published successfully (${publishedItems.length} post(s))!\nRoot URI: ${initialRoot?.uri}\n\n${manifest}`
+          `Thread published successfully (${publishedItems.length} post(s))!\nRoot URI: ${initialRoot?.uri}\nPost-Flight: ${verifySummary}\n\n${manifest}`
         );
       } catch (error) {
         return mcpErrorResponse(`Error creating thread: ${error instanceof Error ? error.message : String(error)}`);
@@ -1227,17 +1359,25 @@ export function registerTools(server: any, getAgent: AgentProvider): void {
           return mcpErrorResponse(`Failed to get profile for ${handle}.`);
         }
 
-        const profile = response.data;
+        const profile = response.data as any;
+        const pronouns = typeof profile.pronouns === 'string' && profile.pronouns.trim() ? profile.pronouns.trim() : '';
+        const pinnedUri = typeof profile.pinnedPost?.uri === 'string' && profile.pinnedPost.uri.trim() ? profile.pinnedPost.uri.trim() : '';
 
-        let profileText = `Profile for ${profile.displayName || handle} (@${profile.handle})
-DID: ${profile.did}
-${profile.description ? `Bio: ${profile.description}` : ''}
-Followers: ${profile.followersCount || 0}
-Following: ${profile.followsCount || 0}
-Posts: ${profile.postsCount || 0}
-${profile.labels?.length ? `Labels: ${profile.labels.map((l: any) => l.val).join(', ')}` : ''}`;
+        const profileLines = [
+          `Profile for ${profile.displayName || handle} (@${profile.handle})`,
+          `DID: ${profile.did}`,
+        ];
+        if (pronouns) profileLines.push(`Pronouns: ${pronouns}`);
+        if (profile.description) profileLines.push(`Bio: ${profile.description}`);
+        profileLines.push(`Followers: ${profile.followersCount || 0}`);
+        profileLines.push(`Following: ${profile.followsCount || 0}`);
+        profileLines.push(`Posts: ${profile.postsCount || 0}`);
+        if (pinnedUri) profileLines.push(`Pinned Post: ${pinnedUri}`);
+        if (profile.labels?.length) {
+          profileLines.push(`Labels: ${profile.labels.map((l: any) => l.val).join(', ')}`);
+        }
 
-        return mcpSuccessResponse(profileText);
+        return mcpSuccessResponse(profileLines.join('\n'));
       } catch (error) {
         return mcpErrorResponse(`Error fetching profile: ${error instanceof Error ? error.message : String(error)}`);
       }
