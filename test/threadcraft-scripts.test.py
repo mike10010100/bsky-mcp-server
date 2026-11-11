@@ -17,6 +17,7 @@ SCRIPTS_DIR = REPO_ROOT / "skills" / "bsky-threadcraft" / "scripts"
 SAMPLER_PY = SCRIPTS_DIR / "sample_mike_posts.py"
 AISIGNS_PY = SCRIPTS_DIR / "fetch_aisigns_digest.py"
 LINTER_PY = SCRIPTS_DIR / "lint_thread.py"
+CARD_PY = SCRIPTS_DIR / "render_receipt_card.py"
 
 
 def load_module(name: str, path: Path):
@@ -248,12 +249,271 @@ process.stdout.write(JSON.stringify(counts));
     assert mismatches == 0, f"python_grapheme_count diverged on {mismatches}/200 generated Unicode cases"
 
 
+def _independent_png_inspect(path: Path) -> tuple[int, int, set[bytes]]:
+    """Independently parse PNG binary chunks without relying on renderer helpers."""
+    data = path.read_bytes()
+    assert len(data) > 40_000, f"PNG suspiciously small ({len(data)} bytes): {path}"
+    assert data[:8] == b"\x89PNG\r\n\x1a\n", f"Invalid PNG magic header in {path}"
+    pos = 8
+    width = height = 0
+    chunk_types: set[bytes] = set()
+    while pos + 8 <= len(data):
+        length = int.from_bytes(data[pos : pos + 4], "big")
+        ctype = data[pos + 4 : pos + 8]
+        chunk_types.add(ctype)
+        payload = data[pos + 8 : pos + 8 + length]
+        if ctype == b"IHDR":
+            width = int.from_bytes(payload[0:4], "big")
+            height = int.from_bytes(payload[4:8], "big")
+        pos += 12 + length
+        if ctype == b"IEND":
+            break
+    assert b"IHDR" in chunk_types and b"IDAT" in chunk_types and b"IEND" in chunk_types
+    return width, height, chunk_types
+
+
+def test_s5_receipt_card_renderer_end_to_end_and_lint_compat() -> None:
+    """Real Chromium rendering, dynamic DOM height cropping, HTML entity safety, CLI modes, and lint_thread.py compatibility."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        spec = {
+            "cards": [
+                {
+                    "type": "document",
+                    "output": "compact.png",
+                    "theme": "crimson",
+                    "eyebrow": "Executive Order 14318",
+                    "title": "Compact Single-Box Card",
+                    "badge": "July 23, 2025",
+                    "section": "Section 4",
+                    "quote": "**Sec. 4.** ==red:Executive Order 14141 is hereby revoked.==",
+                    "footer_left": "Source: 90 FR 35385",
+                },
+                {
+                    "type": "document",
+                    "output": "tall_escaping.png",
+                    "theme": "emerald",
+                    "eyebrow": "Statutory & HTML Safety <script>",
+                    "title": "Tall Multi-Box Card With Stats & Entities",
+                    "subtitle": "§45Y & §48E < $100M",
+                    "badge": "Nov 10, 2026",
+                    "stats": [
+                        {"label": "Yea", "value": "211", "note": "Tabled"},
+                        {"label": "Nay", "value": "204", "note": "202 Dem + 2 GOP"},
+                    ],
+                    "boxes": [
+                        {
+                            "label": "Box 1 • Raw <script> & Ampersand",
+                            "quote": "Literal <script>window.__bad=1</script> & ==green:highlighted <tag attr=\"x\">== must escape cleanly.",
+                        },
+                        {
+                            "label": "Box 2 • Secondary Provision",
+                            "quote": "Second callout box ==with yellow highlight== expanding vertical flow height naturally.",
+                        },
+                        {
+                            "label": "Box 3 • Long Excerpt Alt Truncation Check",
+                            "quote": ("Verbatim statutory sentence with numbers 12345 and clean context. " * 22).strip(),
+                        },
+                    ],
+                    "footer_left": "Primary Source: Official Clerk XML",
+                    "footer_right": "Card 2 of 4",
+                },
+                {
+                    "type": "post",
+                    "output": "social_light.png",
+                    "theme": "blue",
+                    "surface": "light",
+                    "eyebrow": "Archived Thread",
+                    "title": "OP Walkback Chain",
+                    "posts": [
+                        {
+                            "name": "Poster One",
+                            "handle": "poster.bsky.social",
+                            "date": "Nov 10, 2026",
+                            "text": "First claim with ==highlighted phrase== & <angle> brackets.",
+                        },
+                        {
+                            "name": "Poster One",
+                            "handle": "@poster.bsky.social",
+                            "date": "Nov 10, 2026",
+                            "text": "Immediate walkback ==red:contradicting the first post==.",
+                            "note": "Self-reply 4 minutes later.",
+                        },
+                    ],
+                },
+                {
+                    "type": "social",
+                    "output": "social_dark.png",
+                    "theme": "amber",
+                    "surface": "dark",
+                    "author_name": "Night Owl",
+                    "handle": "owl.bsky.social",
+                    "date": "Oct 31, 2026",
+                    "quote": "Single-post shorthand on ==blue:dark surface==.",
+                },
+            ]
+        }
+        spec_path = tmp_dir / "cards_spec.json"
+        manifest_path = tmp_dir / "manifest.json"
+        spec_path.write_text(json.dumps(spec), encoding="utf-8")
+
+        res = subprocess.run(
+            [
+                sys.executable,
+                str(CARD_PY),
+                str(spec_path),
+                "--out-dir",
+                str(tmp_dir),
+                "--manifest",
+                str(manifest_path),
+                "--save-html",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert manifest["count"] == 4
+        assert len(manifest["imagePaths"]) == 4 and len(manifest["imageAlts"]) == 4
+
+        # Independent binary inspection & dynamic auto-crop height check
+        w_compact, h_compact, _ = _independent_png_inspect(tmp_dir / "compact.png")
+        w_tall, h_tall, _ = _independent_png_inspect(tmp_dir / "tall_escaping.png")
+        w_soc_l, h_soc_l, _ = _independent_png_inspect(tmp_dir / "social_light.png")
+        w_soc_d, h_soc_d, _ = _independent_png_inspect(tmp_dir / "social_dark.png")
+        assert (w_compact, w_tall, w_soc_l, w_soc_d) == (2400, 2400, 2400, 2400)
+        assert h_compact < h_tall, f"Expected compact card ({h_compact}px) < tall 3-box card ({h_tall}px)"
+        assert h_soc_d < h_soc_l, f"Expected 1-post social card ({h_soc_d}px) < 2-post chain ({h_soc_l}px)"
+
+        # Verify raw <script> was escaped in generated HTML and markup stripped from imageAlts
+        tall_html = (tmp_dir / "tall_escaping.html").read_text(encoding="utf-8")
+        assert "<script>window.__bad" not in tall_html
+        assert "&lt;script&gt;window.__bad=1&lt;/script&gt;" in tall_html
+        assert '<mark class="hl hl-green">highlighted &lt;tag attr=&quot;x&quot;&gt;</mark>' in tall_html
+
+        for alt in manifest["imageAlts"]:
+            assert 20 <= len(alt) <= 950, f"Alt length out of bounds ({len(alt)}): {alt}"
+            assert "==" not in alt and "**" not in alt and "—" not in alt
+
+        # Single-card CLI mode check (--type post --post ...)
+        cli_png = tmp_dir / "cli_post.png"
+        res_cli = subprocess.run(
+            [
+                sys.executable,
+                str(CARD_PY),
+                "--type",
+                "post",
+                "--post",
+                "Alex Rivera|arivera.bsky.social|Nov 10, 2026|Direct CLI ==green:post receipt== check.",
+                "-o",
+                str(cli_png),
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        cli_manifest = json.loads(res_cli.stdout)
+        assert "@arivera.bsky.social" in cli_manifest["imageAlts"][0]
+        _independent_png_inspect(cli_png)
+
+        # End-to-end compatibility with draft.json -> lint_thread.py --strict
+        draft_payload = {
+            "posts": [
+                {
+                    "text": "Here is what the official filing and the author's own follow-up post actually say.",
+                    "imagePaths": manifest["imagePaths"],
+                    "imageAlts": manifest["imageAlts"],
+                }
+            ]
+        }
+        draft_json = tmp_dir / "draft.json"
+        draft_json.write_text(json.dumps(draft_payload), encoding="utf-8")
+        lint_res = subprocess.run(
+            [sys.executable, str(LINTER_PY), "--strict", "--mode", "explainer", str(draft_json)],
+            capture_output=True,
+            text=True,
+        )
+        assert lint_res.returncode == 0, f"lint_thread.py rejected rendered manifest:\n{lint_res.stdout}\n{lint_res.stderr}"
+
+        # Clean error contracts (non-zero exit, actionable [ERROR], zero traceback)
+        for bad_args in (
+            ["--type", "document", "--quote", "Missing title"],
+            ["--type", "post", "--title", "Missing posts"],
+            ["--type", "bogus", "--title", "Bad type", "--quote", "x"],
+            ["--type", "post", "--post", "OnlyTwoFields|bad"],
+        ):
+            bad_res = subprocess.run(
+                [sys.executable, str(CARD_PY), *bad_args],
+                capture_output=True,
+                text=True,
+            )
+            assert bad_res.returncode == 1
+            assert "[ERROR]" in bad_res.stderr
+            assert "Traceback" not in bad_res.stderr
+
+
+def test_s6_systematic_card_markup_and_alt_fuzzing() -> None:
+    """Seeded systematic exploration (seed=20261111, 150 adversarial inputs) for HTML escaping & alt-text invariants."""
+    card_mod = load_module("card_mod", CARD_PY)
+    rng = random.Random(20261111)
+    fragments = [
+        "<script>alert(1)</script>",
+        "<img src=x onerror=y>",
+        "§45Y & §48E < $100M",
+        '"quoted" & \'single\'',
+        "==highlighted <tag> & text==",
+        "==green:emerald **nested** span==",
+        "==red:crimson\nmultiline==",
+        "==blue:sky span==",
+        "**bold <raw> & text**",
+        "Normal statutory prose.",
+        "\n\n",
+    ]
+    for i in range(150):
+        body = " ".join(rng.choice(fragments) for _ in range(rng.randint(1, 25)))
+        doc_html, doc_alt = card_mod.build_document_card_html_and_alt(
+            {
+                "title": f"Case {i} <raw> & title",
+                "eyebrow": "Source & <Tag>",
+                "badge": "2026",
+                "quote": body,
+                "footer_left": "clerk.house.gov?a=1&b=2",
+            },
+            width=1200,
+        )
+        assert "<script>" not in doc_html and "<img src=x" not in doc_html and "<raw>" not in doc_html
+        assert 10 <= len(doc_alt) <= 950
+        assert "—" not in doc_alt and "==" not in doc_alt
+
+        post_html, post_alt = card_mod.build_post_card_html_and_alt(
+            {
+                "surface": "dark" if i % 2 else "light",
+                "theme": rng.choice(list(card_mod.THEMES.keys())),
+                "posts": [
+                    {
+                        "name": "User <One>",
+                        "handle": "user.bsky.social" if i % 2 else "@user.bsky.social",
+                        "date": "Nov 10",
+                        "text": body,
+                    }
+                ],
+            },
+            width=1200,
+        )
+        assert "<script>" not in post_html and "<img src=x" not in post_html and "<One>" not in post_html
+        assert "@user.bsky.social" in post_html and "@@user" not in post_html
+        assert 10 <= len(post_alt) <= 950
+        assert "==" not in post_alt
+
+
 def main() -> int:
     suites = [
         ("R1: WP:AISIGNS self-closing <ref/> & nested {{cot}} regression", test_r1_aisigns_self_closing_ref_and_nested_cot_regression),
         ("R2: Voice sampler excludes @bot-pings/URLs & reconstructs mode-stratified self-threads", test_r2_sampler_excludes_bot_ping_and_bare_urls_while_reconstructing_threads),
         ("S3: lint_thread.py hard gates, schema checks, image alts, and WP:AISIGNS advisories", test_s3_linter_cli_contracts),
         ("S4: Systematic grapheme exploration (seed=20261110, 200 Unicode/ZWJ/URL cases vs @atproto/api RichText)", test_s4_systematic_grapheme_parity_with_atproto_richtext),
+        ("S5: render_receipt_card.py real Chromium CDP crop, HTML escaping & lint_thread.py compatibility", test_s5_receipt_card_renderer_end_to_end_and_lint_compat),
+        ("S6: Systematic receipt-card markup & alt-text fuzzing (seed=20261111, 150 adversarial cases)", test_s6_systematic_card_markup_and_alt_fuzzing),
     ]
     failed = 0
     for name, fn in suites:
